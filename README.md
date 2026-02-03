@@ -118,3 +118,10 @@ Currently only the **custom voice** model is supported.
 # Further Optimization (contribution is welcome)
 - Chunk prefill for smaller first chunk latency: Current running prefill stage on eager mode
 - Support voice clone, voice design
+- Make prefill stage run with CUDAGraph
+
+## Star History
+![Star History Chart](https://api.star-history.com/svg?repos=tsdocode/nano-qwen3tts-vllm&type=Date)
+
+
+
