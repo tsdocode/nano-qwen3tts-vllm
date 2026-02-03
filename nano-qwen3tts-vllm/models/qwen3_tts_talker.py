@@ -83,14 +83,19 @@ class Qwen3TTSTalkerForCausalLM(nn.Module):
 
         Handles:
         1. Removing "talker." prefix from all keys
-        2. MLP uses separate gate_proj, up_proj, down_proj (no fusion)
-        3. Attention uses separate q_proj, k_proj, v_proj (no fusion)
+        2. Skipping code_predictor and speaker_encoder keys (not part of talker model)
+        3. MLP uses separate gate_proj, up_proj, down_proj (no fusion)
+        4. Attention uses separate q_proj, k_proj, v_proj (no fusion)
         """
         transformed = {}
 
         for key, value in state_dict.items():
-            # Skip code_predictor keys only
+            # Skip code_predictor keys (used by predictor model, not talker)
             if key.startswith("talker.code_predictor."):
+                continue
+            
+            # Skip speaker_encoder keys (not part of talker model architecture)
+            if key.startswith("speaker_encoder."):
                 continue
 
             # Remove "talker." prefix
