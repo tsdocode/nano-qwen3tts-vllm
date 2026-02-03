@@ -106,6 +106,9 @@ def main():
         )
     print("✓ Model loaded successfully")
     
+    # Use the interface's built-in speech tokenizer for decoding
+    speech_tokenizer = interface.speech_tokenizer
+    
     # Load reference audio
     print(f"\nLoading reference audio from: {args.ref_audio}")
     ref_audio, ref_sr = sf.read(args.ref_audio)
@@ -132,13 +135,13 @@ def main():
     elapsed = time.time() - start_time
     
     print(f"✓ Voice clone prompt created in {elapsed:.2f}s")
-    print(f"  - Speaker embedding shape: {voice_clone_prompt['ref_spk_embedding'][0].shape}")
-    if voice_clone_prompt['ref_code'][0] is not None:
-        print(f"  - Reference code shape: {voice_clone_prompt['ref_code'][0].shape}")
+    print(f"  - Speaker embedding shape: {voice_clone_prompt['ref_spk_embedding'].shape}")
+    if voice_clone_prompt['ref_code'] is not None:
+        print(f"  - Reference code shape: {voice_clone_prompt['ref_code'].shape}")
     else:
         print(f"  - Reference code: None (x_vector_only_mode)")
-    print(f"  - ICL mode: {voice_clone_prompt['icl_mode'][0]}")
-    print(f"  - x_vector_only_mode: {voice_clone_prompt['x_vector_only_mode'][0]}")
+    print(f"  - ICL mode: {voice_clone_prompt['icl_mode']}")
+    print(f"  - x_vector_only_mode: {voice_clone_prompt['x_vector_only_mode']}")
     
     # Example 1: Single voice clone generation
     print("\n" + "-" * 60)
@@ -149,11 +152,17 @@ def main():
     
     print(f"Text: {sentence1}")
     start_time = time.time()
-    wavs, sr = interface.generate_voice_clone(
+    
+    # Generate codec chunks
+    audio_codes = list(interface.generate_voice_clone(
         text=sentence1,
         language="English",
         voice_clone_prompt=voice_clone_prompt,
-    )
+    ))
+    
+    # Decode to audio
+    wavs, sr = speech_tokenizer.decode([{"audio_codes": audio_codes}])
+    
     elapsed = time.time() - start_time
     
     output_path = output_dir / "voice_clone_example_1.wav"
@@ -170,11 +179,17 @@ def main():
     
     print(f"Text: {sentence2}")
     start_time = time.time()
-    wavs, sr = interface.generate_voice_clone(
+    
+    # Generate codec chunks
+    audio_codes = list(interface.generate_voice_clone(
         text=sentence2,
         language="English",
         voice_clone_prompt=voice_clone_prompt,
-    )
+    ))
+    
+    # Decode to audio
+    wavs, sr = speech_tokenizer.decode([{"audio_codes": audio_codes}])
+    
     elapsed = time.time() - start_time
     
     output_path = output_dir / "voice_clone_example_2.wav"
@@ -182,37 +197,10 @@ def main():
     print(f"✓ Generated in {elapsed:.2f}s")
     print(f"  Saved to: {output_path}")
     
-    # Example 3: Batch voice clone generation
-    print("\n" + "-" * 60)
-    print("[Example 3] Batch generation with cloned voice")
-    print("-" * 60)
-    
-    sentences = [
-        "No problem! I actually... kinda finished those already? If you want to compare answers or something...",
-        "What? No! I mean yes but not like... I just think you're... your titration technique is really precise!",
-        "This is a third sentence generated with the same cloned voice.",
-    ]
-    
-    print(f"Generating {len(sentences)} samples in batch...")
-    start_time = time.time()
-    wavs, sr = interface.generate_voice_clone(
-        text=sentences,
-        language=["English"] * len(sentences),
-        voice_clone_prompt=voice_clone_prompt,
-    )
-    elapsed = time.time() - start_time
-    
-    for i, wav in enumerate(wavs):
-        output_path = output_dir / f"voice_clone_batch_{i+1}.wav"
-        sf.write(str(output_path), wav, sr)
-        print(f"✓ Batch item {i+1} saved to: {output_path}")
-    
-    print(f"\n✓ Batch generation completed in {elapsed:.2f}s ({elapsed/len(sentences):.2f}s per sample)")
-    
-    # Example 4: Compare ICL mode vs x_vector_only_mode (if ref_text was provided)
+    # Example 3: Compare ICL mode vs x_vector_only_mode (if ref_text was provided)
     if args.ref_text and not args.x_vector_only:
         print("\n" + "-" * 60)
-        print("[Example 4] Comparing ICL mode vs x_vector_only_mode")
+        print("[Example 3] Comparing ICL mode vs x_vector_only_mode")
         print("-" * 60)
         
         test_text = "This sentence compares ICL mode with x_vector_only mode."
@@ -220,11 +208,12 @@ def main():
         # ICL mode (already created)
         print("\nICL mode (with reference code):")
         start_time = time.time()
-        wavs_icl, sr = interface.generate_voice_clone(
+        audio_codes_icl = list(interface.generate_voice_clone(
             text=test_text,
             language="English",
             voice_clone_prompt=voice_clone_prompt,
-        )
+        ))
+        wavs_icl, sr = speech_tokenizer.decode([{"audio_codes": audio_codes_icl}])
         elapsed_icl = time.time() - start_time
         output_path_icl = output_dir / "voice_clone_icl_mode.wav"
         sf.write(str(output_path_icl), wavs_icl[0], sr)
@@ -238,11 +227,12 @@ def main():
             x_vector_only_mode=True,
         )
         start_time = time.time()
-        wavs_xvec, sr = interface.generate_voice_clone(
+        audio_codes_xvec = list(interface.generate_voice_clone(
             text=test_text,
             language="English",
             voice_clone_prompt=voice_clone_prompt_xvec,
-        )
+        ))
+        wavs_xvec, sr = speech_tokenizer.decode([{"audio_codes": audio_codes_xvec}])
         elapsed_xvec = time.time() - start_time
         output_path_xvec = output_dir / "voice_clone_xvec_only.wav"
         sf.write(str(output_path_xvec), wavs_xvec[0], sr)

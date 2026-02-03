@@ -24,9 +24,6 @@ from pathlib import Path
 
 import soundfile as sf
 
-# Add parent directory to path to import nano_qwen3tts_vllm
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 from nano_qwen3tts_vllm.interface import Qwen3TTSInterface
 
 
@@ -80,6 +77,9 @@ def main():
         )
     print("✓ Model loaded successfully")
     
+    # Use the interface's built-in speech tokenizer for decoding
+    speech_tokenizer = interface.speech_tokenizer
+    
     # Example 1: Single voice design generation
     print("\n" + "-" * 60)
     print("[Example 1] Generating speech with voice design instruction")
@@ -92,11 +92,17 @@ def main():
     print(f"Instruct: {instruct}")
     
     start_time = time.time()
-    wavs, sr = interface.generate_voice_design(
+    
+    # Generate codec chunks
+    audio_codes = list(interface.generate_voice_design(
         text=text,
         instruct=instruct,
         language="English",
-    )
+    ))
+    
+    # Decode to audio
+    wavs, sr = speech_tokenizer.decode([{"audio_codes": audio_codes}])
+    
     elapsed = time.time() - start_time
     
     output_path = output_dir / "voice_design_example_1.wav"
@@ -133,52 +139,21 @@ def main():
         print(f"  Instruct: {example['instruct']}")
         
         start_time = time.time()
-        wavs, sr = interface.generate_voice_design(
+        audio_codes = list(interface.generate_voice_design(
             text=example["text"],
             instruct=example["instruct"],
             language="English",
-        )
+        ))
+        wavs, sr = speech_tokenizer.decode([{"audio_codes": audio_codes}])
         elapsed = time.time() - start_time
         
         output_path = output_dir / example["output"]
         sf.write(str(output_path), wavs[0], sr)
         print(f"  ✓ Generated in {elapsed:.2f}s, saved to: {output_path}")
     
-    # Example 3: Batch generation
+    # Example 3: Different languages
     print("\n" + "-" * 60)
-    print("[Example 3] Batch generation with different instructions")
-    print("-" * 60)
-    
-    texts = [
-        "Hello, this is a test of voice design.",
-        "I can generate different voices with natural language descriptions.",
-        "Batch processing allows generating multiple voices efficiently.",
-    ]
-    instructs = [
-        "Female, 25 years old, cheerful and energetic",
-        "Male, 40 years old, calm and professional",
-        "Female, 30 years old, friendly and warm",
-    ]
-    
-    print(f"Generating {len(texts)} samples in batch...")
-    start_time = time.time()
-    wavs, sr = interface.generate_voice_design(
-        text=texts,
-        instruct=instructs,
-        language=["English"] * len(texts),
-    )
-    elapsed = time.time() - start_time
-    
-    for i, wav in enumerate(wavs):
-        output_path = output_dir / f"voice_design_batch_{i+1}.wav"
-        sf.write(str(output_path), wav, sr)
-        print(f"✓ Batch item {i+1} saved to: {output_path}")
-    
-    print(f"\n✓ Batch generation completed in {elapsed:.2f}s ({elapsed/len(texts):.2f}s per sample)")
-    
-    # Example 4: Different languages
-    print("\n" + "-" * 60)
-    print("[Example 4] Multi-language voice design")
+    print("[Example 3] Multi-language voice design")
     print("-" * 60)
     
     multilingual_examples = [
@@ -202,11 +177,12 @@ def main():
         print(f"  Instruct: {example['instruct']}")
         
         start_time = time.time()
-        wavs, sr = interface.generate_voice_design(
+        audio_codes = list(interface.generate_voice_design(
             text=example["text"],
             instruct=example["instruct"],
             language=example["language"],
-        )
+        ))
+        wavs, sr = speech_tokenizer.decode([{"audio_codes": audio_codes}])
         elapsed = time.time() - start_time
         
         output_path = output_dir / example["output"]
