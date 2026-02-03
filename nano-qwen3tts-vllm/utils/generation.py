@@ -73,9 +73,18 @@ def prepare_inputs(
     if instruct_ids is not None:
         for index, instruct_id in enumerate(instruct_ids):
             if instruct_id is not None:
-                talker_input_embeds[index].append(
-                    text_projection(text_embedding(instruct_id))
-                )
+                # Ensure instruct_id has correct shape [1, seq_len] or [batch, seq_len]
+                if instruct_id.dim() == 1:
+                    instruct_id = instruct_id.unsqueeze(0)
+                # Ensure instruct_id is on the correct device
+                if isinstance(device, str):
+                    device_obj = torch.device(device)
+                else:
+                    device_obj = device
+                instruct_id = instruct_id.to(device_obj)
+                # Apply text embedding then projection (matches original Qwen3-TTS)
+                instruct_embed = text_projection(text_embedding(instruct_id))
+                talker_input_embeds[index].append(instruct_embed)
 
     trailing_text_hiddens = []
     if speakers is None:

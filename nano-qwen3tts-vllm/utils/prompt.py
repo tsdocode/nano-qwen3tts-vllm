@@ -24,7 +24,15 @@ def _tokenize_texts(texts: List[str], processor: ProcessorMixin, device: torch.d
     for text in texts:
         input = processor(text=text, return_tensors="pt", padding=True)
         input_id = input["input_ids"].to(device)
-        input_id = input_id.unsqueeze(0) if input_id.dim() == 1 else input_id
+        # Processor with return_tensors="pt" should return [batch, seq_len]
+        # Unsqueeze only if we got a 1D tensor (shouldn't happen but safeguard)
+        if input_id.dim() == 1:
+            input_id = input_id.unsqueeze(0)
+        # Ensure shape is [1, seq_len] for single text input
+        if input_id.dim() == 2 and input_id.size(0) != 1:
+            # If batch size is not 1, something unexpected happened
+            # This should not occur for single text input, but log/handle if it does
+            pass
         input_ids.append(input_id)
     return input_ids
 
@@ -35,13 +43,14 @@ def prepare_custom_voice_prompt(
     instruct: Optional[Union[str, List[str]]] = None,
     non_streaming_mode: bool = True,
     processor: ProcessorMixin = None,
-    model_size: str = "0b6",
+    model_size: str = "1.7b",  # Default to 1.7B (supports instruct), not 0.6B
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ):
     texts = _ensure_list(text)
     languages = _ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
     speakers = _ensure_list(speaker)
-    if model_size in "0b6": # for 0b6 model, instruct is not supported
+    # Only disable instruct for 0.6B model (which doesn't support it)
+    if model_size == "0b6" or model_size == "0.6b":
         instruct = None
     instructs = _ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
 

@@ -718,11 +718,15 @@ class Qwen3TTSInterface:
     ):
         """Generate speech with voice design (yields codec chunks).
         
+        Voice design generates speech based on natural language instructions describing
+        the desired voice characteristics (gender, age, tone, etc.). The instruct parameter
+        controls the voice output, and no speaker embedding is used.
+        
         This is a generator that yields codebook_id chunks. Use SpeechTokenizer to decode.
         
         Args:
             text: Text to synthesize (single string only, no batch support).
-            instruct: Instruction describing desired voice/style.
+            instruct: Instruction describing desired voice/style (e.g., "Male, 30 years old, deep voice").
             language: Language for the sample (default: "Auto").
             non_streaming_mode: Using non-streaming text input.
         
@@ -730,7 +734,10 @@ class Qwen3TTSInterface:
             Codebook ID chunks (List[int]). Use SpeechTokenizer.decode() to convert to audio.
             
         Example:
-            chunks = list(interface.generate_voice_design(text="Hello", instruct="cheerful voice"))
+            chunks = list(interface.generate_voice_design(
+                text="Hello", 
+                instruct="Male, 30 years old, calm and professional"
+            ))
             wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
         """
         if self.zmq_bridge is not None:
@@ -739,23 +746,24 @@ class Qwen3TTSInterface:
         if language is None:
             language = "Auto"
         
-        # Prepare prompts
+        # Prepare prompts - voice design doesn't use speakers, only instruct
         input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
             text=[text],
-            speaker=[""],  # Voice design doesn't use speakers
+            speaker=[""],  # Empty string for voice design mode
             language=[language],
             instruct=[instruct],
             processor=self.processor,
             device=self.device,
         )
         
-        # Prepare inputs
+        # Prepare inputs - pass None for speakers in voice design mode
+        # This ensures no speaker embedding interferes with the instruct-based voice
         talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = prepare_inputs(
             config=self.model_config,
             input_ids=input_ids,
             instruct_ids=instruct_ids,
             languages=languages,
-            speakers=speakers,
+            speakers=None,  # Voice design mode uses instruct only, no speaker embedding
             non_streaming_mode=non_streaming_mode,
             text_embedding=self.text_embedding,
             input_embedding=self.input_embedding,
