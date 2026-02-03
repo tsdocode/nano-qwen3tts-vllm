@@ -54,7 +54,7 @@ class Qwen3TTSCodePredictorForCausalLM(nn.Module):
         
         print(config.hidden_size, talker_config.hidden_size)
         self.lm_head = nn.ModuleList(
-            [nn.Linear(config.hidden_size, talker_config.hidden_size, bias=False) for _ in range(config.num_code_groups - 1)]
+            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(config.num_code_groups - 1)]
         )
         
         if config.hidden_size != talker_config.hidden_size:
