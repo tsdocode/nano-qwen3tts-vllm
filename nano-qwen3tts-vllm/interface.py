@@ -285,7 +285,7 @@ class Qwen3TTSInterface:
         try:
             # Try to load speech tokenizer
             if HAS_SPEECH_TOKENIZER:
-                self.speech_tokenizer = SpeechTokenizer(self.model_path, dtype=torch.bfloat16)
+                self.speech_tokenizer = SpeechTokenizer("Qwen/Qwen3-TTS-Tokenizer-12Hz", dtype=torch.bfloat16)
             
             # Try to load speaker encoder from model
             # Check if speaker_encoder exists in the model
@@ -531,131 +531,92 @@ class Qwen3TTSInterface:
     
     def create_voice_clone_prompt(
         self,
-        ref_audio: Union[Any, List[Any]],
-        ref_text: Optional[Union[str, List[Optional[str]]]] = None,
-        x_vector_only_mode: Union[bool, List[bool]] = False,
+        ref_audio: Any,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
     ) -> Dict[str, Any]:
-        """Build voice-clone prompt items from reference audio (and optionally reference text).
+        """Build voice-clone prompt from reference audio (and optionally reference text).
         
         Args:
-            ref_audio: Reference audio(s). Can be:
+            ref_audio: Reference audio. Can be:
                 - str: wav path / URL / base64
                 - (np.ndarray, sr): waveform + sampling rate tuple
-                - list of the above
-            ref_text: Reference transcript(s). Required when x_vector_only_mode=False (ICL mode).
+            ref_text: Reference transcript. Required when x_vector_only_mode=False (ICL mode).
             x_vector_only_mode: Whether to use speaker embedding only. If False, ICL mode will be used.
         
         Returns:
-            voice_clone_prompt dict with keys: ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode.
-            Each value is a list (one per batch item).
+            voice_clone_prompt dict with keys: ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode, ref_text.
         """
         if self.speech_tokenizer is None:
             raise RuntimeError("speech_tokenizer not available. Cannot create voice clone prompt.")
         
-        ref_audio_list = _ensure_list(ref_audio)
-        ref_text_list = _ensure_list(ref_text) if isinstance(ref_text, list) else ([ref_text] * len(ref_audio_list) if ref_text is not None else [None] * len(ref_audio_list))
-        xvec_list = _ensure_list(x_vector_only_mode) if isinstance(x_vector_only_mode, list) else ([x_vector_only_mode] * len(ref_audio_list))
+        if not x_vector_only_mode:
+            if ref_text is None or ref_text == "":
+                raise ValueError("ref_text is required when x_vector_only_mode=False (ICL mode).")
         
-        if len(ref_text_list) != len(ref_audio_list) or len(xvec_list) != len(ref_audio_list):
-            raise ValueError(
-                f"Batch size mismatch: ref_audio={len(ref_audio_list)}, ref_text={len(ref_text_list)}, x_vector_only_mode={len(xvec_list)}"
-            )
-        
-        normalized = self._normalize_audio_inputs(ref_audio_list)
+        # Normalize audio input
+        wav, sr = self._normalize_audio_inputs([ref_audio])[0]
         
         # Encode audio to codes
-        ref_wavs_for_code: List[np.ndarray] = []
-        ref_sr_for_code: List[int] = []
-        for wav, sr in normalized:
-            ref_wavs_for_code.append(wav)
-            ref_sr_for_code.append(sr)
+        enc = self.speech_tokenizer.tokenizer.encode(wav, sr=sr)
+        # enc.audio_codes[0] is [time, 16]
+        ref_code = enc.audio_codes[0].cpu()
         
-        if len(set(ref_sr_for_code)) == 1:
-            # Batch encode if same sample rate
-            # Pass list of numpy arrays directly to tokenizer (not stacked tensor!)
-            enc = self.speech_tokenizer.tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
-            # enc.audio_codes is a list of [time, 16] tensors
-            ref_codes = [code.cpu() for code in enc.audio_codes]
-        else:
-            # Encode individually if different sample rates
-            ref_codes = []
-            for wav, sr in normalized:
-                # Pass numpy array directly to tokenizer
-                enc = self.speech_tokenizer.tokenizer.encode(wav, sr=sr)
-                # enc.audio_codes[0] is [time, 16]
-                ref_codes.append(enc.audio_codes[0].cpu())
+        # Resample to 24kHz for speaker encoder if needed
+        wav_resample = wav
+        if sr != 24000:
+            wav_resample = librosa.resample(
+                y=wav_resample.astype(np.float32),
+                orig_sr=int(sr),
+                target_sr=24000
+            )
         
-        # Extract speaker embeddings and build prompt
-        ref_spk_embeddings = []
-        ref_codes_list = []
-        x_vector_only_list = []
-        icl_mode_list = []
-        
-        for i, ((wav, sr), code, rtext, xvec_only) in enumerate(zip(normalized, ref_codes, ref_text_list, xvec_list)):
-            if not xvec_only:
-                if rtext is None or rtext == "":
-                    raise ValueError(f"ref_text is required when x_vector_only_mode=False (ICL mode). Bad index={i}")
-            
-            # Resample to 24kHz for speaker encoder if needed
-            wav_resample = wav
-            if sr != 24000:
-                wav_resample = librosa.resample(
-                    y=wav_resample.astype(np.float32),
-                    orig_sr=int(sr),
-                    target_sr=24000
-                )
-            
-            # Extract speaker embedding
-            spk_emb = self.extract_speaker_embedding(audio=wav_resample, sr=24000)
-            ref_spk_embeddings.append(spk_emb)
-            
-            # Store ref_code (None if x_vector_only_mode)
-            ref_codes_list.append(None if xvec_only else code)
-            x_vector_only_list.append(bool(xvec_only))
-            icl_mode_list.append(bool(not xvec_only))
+        # Extract speaker embedding
+        spk_emb = self.extract_speaker_embedding(audio=wav_resample, sr=24000)
         
         return {
-            "ref_code": ref_codes_list,
-            "ref_spk_embedding": ref_spk_embeddings,
-            "x_vector_only_mode": x_vector_only_list,
-            "icl_mode": icl_mode_list,
-            "ref_text": ref_text_list,  # Store ref_text for later use in generate_voice_clone
+            "ref_code": None if x_vector_only_mode else ref_code,
+            "ref_spk_embedding": spk_emb,
+            "x_vector_only_mode": bool(x_vector_only_mode),
+            "icl_mode": bool(not x_vector_only_mode),
+            "ref_text": ref_text,  # Store ref_text for later use in generate_voice_clone
         }
     
     def generate_voice_clone(
         self,
-        text: Union[str, List[str]],
-        language: Union[str, List[str]] = None,
-        ref_audio: Optional[Union[Any, List[Any]]] = None,
-        ref_text: Optional[Union[str, List[Optional[str]]]] = None,
-        x_vector_only_mode: Union[bool, List[bool]] = False,
+        text: str,
+        language: str = None,
+        ref_audio: Optional[Any] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
         voice_clone_prompt: Optional[Dict[str, Any]] = None,
         non_streaming_mode: bool = True,
-    ) -> Tuple[List[np.ndarray], int]:
-        """Generate speech using voice clone.
+    ):
+        """Generate speech using voice clone (yields codec chunks).
+        
+        This is a generator that yields codebook_id chunks. Use SpeechTokenizer to decode.
         
         Args:
-            text: Text(s) to synthesize.
-            language: Language(s) for each sample.
-            ref_audio: Reference audio(s) for prompt building. Required if voice_clone_prompt is not provided.
-            ref_text: Reference text(s) used for ICL mode (required when x_vector_only_mode=False).
+            text: Text to synthesize (single string only, no batch support).
+            language: Language for the sample (default: "Auto").
+            ref_audio: Reference audio for prompt building. Required if voice_clone_prompt is not provided.
+            ref_text: Reference transcript used for ICL mode (required when x_vector_only_mode=False).
             x_vector_only_mode: If True, only speaker embedding is used (ignores ref_text/ref_code).
             voice_clone_prompt: Pre-built voice clone prompt dict from create_voice_clone_prompt.
             non_streaming_mode: Using non-streaming text input.
         
-        Returns:
-            Tuple of (wavs: List[np.ndarray], sr: int).
+        Yields:
+            Codebook ID chunks (List[int]). Use SpeechTokenizer.decode() to convert to audio.
+            
+        Example:
+            chunks = list(interface.generate_voice_clone(text="Hello", voice_clone_prompt=prompt))
+            wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
         """
         if self.zmq_bridge is not None:
             raise RuntimeError("generate_voice_clone does not support ZMQ bridge. Use sync mode.")
         
-        texts = _ensure_list(text)
-        languages = _ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
-        
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
-        if len(texts) != len(languages):
-            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
+        if language is None:
+            language = "Auto"
         
         # Build or use voice_clone_prompt
         if voice_clone_prompt is None:
@@ -666,60 +627,43 @@ class Qwen3TTSInterface:
                 ref_text=ref_text,
                 x_vector_only_mode=x_vector_only_mode
             )
-            if len(voice_clone_prompt["ref_spk_embedding"]) == 1 and len(texts) > 1:
-                # Expand single prompt to batch
-                for key in voice_clone_prompt:
-                    voice_clone_prompt[key] = voice_clone_prompt[key] * len(texts)
-            ref_texts_for_ids = ref_text if isinstance(ref_text, list) else ([ref_text] * len(texts) if ref_text else [None] * len(texts))
+            ref_text_for_ids = ref_text
         else:
             # When voice_clone_prompt is provided, check if ICL mode is enabled
             # If so, use ref_text from prompt or provided ref_text parameter
-            icl_mode_enabled = any(voice_clone_prompt.get("icl_mode", []))
+            icl_mode_enabled = voice_clone_prompt.get("icl_mode", False)
             if icl_mode_enabled:
                 # Prefer ref_text from parameter, fallback to stored ref_text in prompt
                 prompt_ref_text = voice_clone_prompt.get("ref_text")
                 if ref_text is not None:
-                    ref_texts_for_ids = ref_text if isinstance(ref_text, list) else ([ref_text] * len(texts) if ref_text else [None] * len(texts))
+                    ref_text_for_ids = ref_text
                 elif prompt_ref_text is not None:
-                    ref_texts_for_ids = prompt_ref_text if isinstance(prompt_ref_text, list) else ([prompt_ref_text] * len(texts) if prompt_ref_text else [None] * len(texts))
+                    ref_text_for_ids = prompt_ref_text
                 else:
                     raise ValueError(
                         "ICL mode is enabled in voice_clone_prompt but ref_text is not available. "
                         "Please provide ref_text when creating voice_clone_prompt or when calling generate_voice_clone."
                     )
-                # Ensure ref_texts_for_ids matches batch size
-                if len(ref_texts_for_ids) == 1 and len(texts) > 1:
-                    ref_texts_for_ids = ref_texts_for_ids * len(texts)
-                elif len(ref_texts_for_ids) != len(texts):
-                    raise ValueError(f"Batch size mismatch: ref_text={len(ref_texts_for_ids)}, text={len(texts)}")
             else:
-                ref_texts_for_ids = None
+                ref_text_for_ids = None
         
-        # Expand voice_clone_prompt if needed (single prompt for multiple texts)
-        # Make a copy to avoid modifying the original dict
-        if len(voice_clone_prompt["ref_spk_embedding"]) == 1 and len(texts) > 1:
-            # Expand single prompt to batch (copy to avoid modifying original)
-            voice_clone_prompt = {key: value * len(texts) for key, value in voice_clone_prompt.items()}
-            # Also expand ref_texts_for_ids if it exists
-            if ref_texts_for_ids is not None and len(ref_texts_for_ids) == 1:
-                ref_texts_for_ids = ref_texts_for_ids * len(texts)
-        elif len(voice_clone_prompt["ref_spk_embedding"]) != len(texts):
-            raise ValueError(f"Batch size mismatch: prompt={len(voice_clone_prompt['ref_spk_embedding'])}, text={len(texts)}")
+        # Tokenize text
+        input_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        input_ids = _tokenize_texts([input_text], self.processor, self.device)
         
-        # Tokenize texts
-        input_texts = [f"<|im_start|>assistant\n{t}<|im_end|>\n<|im_start|>assistant\n" for t in texts]
-        input_ids = _tokenize_texts(input_texts, self.processor, self.device)
-        
-        # Tokenize ref_texts if provided (for ICL mode)
+        # Tokenize ref_text if provided (for ICL mode)
         ref_ids = None
-        if ref_texts_for_ids is not None:
-            ref_ids = []
-            for rt in ref_texts_for_ids:
-                if rt is None or rt == "":
-                    ref_ids.append(None)
-                else:
-                    ref_tok = _tokenize_texts([self._build_ref_text(rt)], self.processor, self.device)[0]
-                    ref_ids.append(ref_tok)
+        if ref_text_for_ids is not None and ref_text_for_ids != "":
+            ref_tok = _tokenize_texts([self._build_ref_text(ref_text_for_ids)], self.processor, self.device)[0]
+            ref_ids = [ref_tok]
+        
+        # Prepare voice_clone_prompt as lists (for compatibility with prepare_inputs which expects batch format)
+        voice_clone_prompt_lists = {
+            "ref_code": [voice_clone_prompt["ref_code"]],
+            "ref_spk_embedding": [voice_clone_prompt["ref_spk_embedding"]],
+            "x_vector_only_mode": [voice_clone_prompt["x_vector_only_mode"]],
+            "icl_mode": [voice_clone_prompt["icl_mode"]],
+        }
         
         # Prepare generate_speaker_prompt_fn and generate_icl_prompt_fn
         def generate_speaker_prompt_fn(prompt):
@@ -746,8 +690,8 @@ class Qwen3TTSInterface:
             config=self.model_config,
             input_ids=input_ids,
             ref_ids=ref_ids,
-            voice_clone_prompt=voice_clone_prompt,
-            languages=languages,
+            voice_clone_prompt=voice_clone_prompt_lists,
+            languages=[language],
             non_streaming_mode=non_streaming_mode,
             text_embedding=self.text_embedding,
             input_embedding=self.input_embedding,
@@ -757,72 +701,50 @@ class Qwen3TTSInterface:
             generate_icl_prompt_fn=generate_icl_prompt_fn,
         )
         
-        # Generate codebook_ids for all batches
-        # Process each batch item separately
-        wavs_all = []
-        sr = None
-        
-        for batch_idx in range(talker_input_embeds.shape[0]):
-            batch_embeds = talker_input_embeds[batch_idx:batch_idx+1]
-            batch_trailing = trailing_text_hiddens[batch_idx:batch_idx+1]
-            batch_pad = tts_pad_embed
-            
-            # Collect all codebook_id chunks for this batch item
-            batch_codebook_ids = []
-            for chunk in self._generate_caller_driven(
-                batch_embeds, batch_trailing, batch_pad,
-                str(uuid.uuid4()),
-                SamplingParams(temperature=1.0, max_tokens=1),
-                SamplingParams(temperature=0.9, max_tokens=17),
-            ):
-                batch_codebook_ids.append(chunk)
-            
-            # Convert to audio for this batch item
-            if batch_codebook_ids:
-                wavs, sr = self._codebook_ids_to_audio(batch_codebook_ids)
-                wavs_all.extend(wavs)
-        
-        return wavs_all, sr
+        # Generate and yield codebook_id chunks
+        yield from self._generate_caller_driven(
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
+            str(uuid.uuid4()),
+            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=17),
+        )
     
     def generate_voice_design(
         self,
-        text: Union[str, List[str]],
-        instruct: Union[str, List[str]],
-        language: Union[str, List[str]] = None,
+        text: str,
+        instruct: str,
+        language: str = None,
         non_streaming_mode: bool = True,
-    ) -> Tuple[List[np.ndarray], int]:
-        """Generate speech with voice design using natural-language style instructions.
+    ):
+        """Generate speech with voice design (yields codec chunks).
+        
+        This is a generator that yields codebook_id chunks. Use SpeechTokenizer to decode.
         
         Args:
-            text: Text(s) to synthesize.
-            instruct: Instruction(s) describing desired voice/style.
-            language: Language(s) for each sample.
+            text: Text to synthesize (single string only, no batch support).
+            instruct: Instruction describing desired voice/style.
+            language: Language for the sample (default: "Auto").
             non_streaming_mode: Using non-streaming text input.
         
-        Returns:
-            Tuple of (wavs: List[np.ndarray], sr: int).
+        Yields:
+            Codebook ID chunks (List[int]). Use SpeechTokenizer.decode() to convert to audio.
+            
+        Example:
+            chunks = list(interface.generate_voice_design(text="Hello", instruct="cheerful voice"))
+            wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
         """
         if self.zmq_bridge is not None:
             raise RuntimeError("generate_voice_design does not support ZMQ bridge. Use sync mode.")
         
-        texts = _ensure_list(text)
-        languages = _ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
-        instructs = _ensure_list(instruct)
-        
-        if len(languages) == 1 and len(texts) > 1:
-            languages = languages * len(texts)
-        if len(instructs) == 1 and len(texts) > 1:
-            instructs = instructs * len(texts)
-        
-        if not (len(texts) == len(languages) == len(instructs)):
-            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}")
+        if language is None:
+            language = "Auto"
         
         # Prepare prompts
         input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
-            text=texts,
-            speaker=[""] * len(texts),  # Voice design doesn't use speakers
-            language=languages,
-            instruct=instructs,
+            text=[text],
+            speaker=[""],  # Voice design doesn't use speakers
+            language=[language],
+            instruct=[instruct],
             processor=self.processor,
             device=self.device,
         )
@@ -841,32 +763,13 @@ class Qwen3TTSInterface:
             device=self.device,
         )
         
-        # Generate codebook_ids for all batches
-        # Process each batch item separately
-        wavs_all = []
-        sr = None
-        
-        for batch_idx in range(talker_input_embeds.shape[0]):
-            batch_embeds = talker_input_embeds[batch_idx:batch_idx+1]
-            batch_trailing = trailing_text_hiddens[batch_idx:batch_idx+1]
-            batch_pad = tts_pad_embed
-            
-            # Collect all codebook_id chunks for this batch item
-            batch_codebook_ids = []
-            for chunk in self._generate_caller_driven(
-                batch_embeds, batch_trailing, batch_pad,
-                str(uuid.uuid4()),
-                SamplingParams(temperature=1.0, max_tokens=1),
-                SamplingParams(temperature=0.9, max_tokens=17),
-            ):
-                batch_codebook_ids.append(chunk)
-            
-            # Convert to audio for this batch item
-            if batch_codebook_ids:
-                wavs, sr = self._codebook_ids_to_audio(batch_codebook_ids)
-                wavs_all.extend(wavs)
-        
-        return wavs_all, sr
+        # Generate and yield codebook_id chunks
+        yield from self._generate_caller_driven(
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
+            str(uuid.uuid4()),
+            SamplingParams(temperature=1.0, max_tokens=1),
+            SamplingParams(temperature=0.9, max_tokens=17),
+        )
     
     async def start_zmq_tasks(self) -> None:
         """Start the ZMQ dispatcher (thread + asyncio task). Engine loops run in separate processes. Call once before generate_async when zmq_bridge is set."""

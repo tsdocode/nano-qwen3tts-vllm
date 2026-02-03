@@ -4,6 +4,8 @@ import torchaudio
 import numpy as np
 from pathlib import Path
 from typing import Union, Tuple, List
+from transformers import AutoConfig, AutoModel, AutoProcessor
+from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
 
 # Import original speech tokenizer
 try:
@@ -15,6 +17,14 @@ try:
         sys.path.insert(0, qwen_tts_path)
     
     from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer as _Qwen3TTSTokenizer
+    # Import to trigger AutoConfig registration for qwen3_tts model types
+    try:
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+        AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
+
+    except:
+        pass  # Registration may have already happened
     HAS_SPEECH_TOKENIZER = True
 except ImportError as e:
     HAS_SPEECH_TOKENIZER = False
@@ -50,7 +60,7 @@ class SpeechTokenizer:
         print(f"Loading speech tokenizer from {model_path}...")
         # Load using Qwen3TTSTokenizer.from_pretrained
         self.tokenizer = _Qwen3TTSTokenizer.from_pretrained(
-            f"{model_path}/speech_tokenizer",
+            model_path,
             device_map="cuda" if torch.cuda.is_available() else "cpu",
             dtype=dtype,
         )
@@ -113,19 +123,39 @@ class SpeechTokenizer:
         return codec_ids
     
     @torch.inference_mode()
-    def decode(self, codec_ids: torch.Tensor) -> Tuple[List[np.ndarray], int]:
+    def decode(self, audio_codes: Union[List[List[int]], torch.Tensor, List[dict]]) -> Tuple[List[np.ndarray], int]:
         """Decode codec IDs to audio waveform.
         
         Args:
-            codec_ids: Codec IDs tensor [batch, num_codebooks=16, time]
+            audio_codes: Can be:
+                - List of codebook_id chunks: [[c0_book0, c0_book1, ..., c0_book15], [c1_book0, ...], ...]
+                - Tensor [batch, num_codebooks=16, time]
+                - List of dicts: [{"audio_codes": codes}] where codes is list or tensor
             
         Returns:
             Tuple of (audio_list, sample_rate)
             - audio_list: List of numpy arrays [samples]
             - sample_rate: Sample rate of output audio
         """
-        # Prepare input for Qwen3TTSTokenizer
-        # It expects [time, 16] format
+        # Handle different input formats
+        if isinstance(audio_codes, list):
+            if len(audio_codes) > 0 and isinstance(audio_codes[0], dict):
+                # Format: [{"audio_codes": ...}]
+                audio_codes = audio_codes[0]["audio_codes"]
+            
+            # Convert list of chunks to tensor
+            if isinstance(audio_codes, list) and len(audio_codes) > 0:
+                # List of codec chunks [[c0_b0, ..., c0_b15], [c1_b0, ..., c1_b15], ...]
+                # Convert to tensor [time, 16]
+                codec_tensor = torch.tensor(audio_codes, dtype=torch.long)  # [time, 16]
+                # Reshape to [1, 16, time] for batch processing
+                codec_ids = codec_tensor.transpose(0, 1).unsqueeze(0)  # [1, 16, time]
+            else:
+                codec_ids = audio_codes
+        else:
+            codec_ids = audio_codes
+        
+        # codec_ids should now be [batch, 16, time]
         batch_size = codec_ids.shape[0]
         
         # Convert from [batch, 16, time] to list of dicts with 'audio_codes' key
