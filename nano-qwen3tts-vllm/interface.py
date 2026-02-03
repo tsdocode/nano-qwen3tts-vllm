@@ -1,17 +1,44 @@
 import asyncio
+import base64
+import io
+import os
 import queue
 import threading
 import uuid
 import torch
 import torch.multiprocessing as mp
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
+
+import librosa
+import numpy as np
 import soundfile as sf
 import time
-from nano_qwen3tts_vllm.utils.prompt import prepare_custom_voice_prompt
+import torch
+from librosa.filters import mel as librosa_mel_fn
+
+from nano_qwen3tts_vllm.utils.prompt import prepare_custom_voice_prompt, _ensure_list, _tokenize_texts
 from nano_qwen3tts_vllm.processor import Qwen3TTSProcessor
-from nano_qwen3tts_vllm.utils.generation import prepare_inputs
+from nano_qwen3tts_vllm.utils.generation import prepare_inputs, generate_speaker_prompt, generate_icl_prompt
 from nano_qwen3tts_vllm.llm import TalkerLLM, PredictorLLM
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
 from nano_qwen3tts_vllm.engine.engine_core import EngineRequest
+
+try:
+    from huggingface_hub import snapshot_download
+    HAS_HF_HUB = True
+except ImportError:
+    HAS_HF_HUB = False
+    snapshot_download = None
+
+try:
+    from nano_qwen3tts_vllm.utils.audio import SpeechTokenizer
+    HAS_SPEECH_TOKENIZER = True
+except ImportError:
+    HAS_SPEECH_TOKENIZER = False
+    SpeechTokenizer = None
 
 
 torch.manual_seed(42)
@@ -25,6 +52,117 @@ def _get_processor(model_path: str):
 
 
 class Qwen3TTSInterface:
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *,
+        cache_dir: Optional[str] = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[str] = None,
+        revision: Optional[str] = None,
+        enforce_eager: bool = False,
+        tensor_parallel_size: int = 1,
+        zmq_bridge=None,
+    ):
+        """Load Qwen3TTSInterface from HuggingFace model repository or local path.
+        
+        This method automatically downloads the model from HuggingFace if it's not
+        available locally. If the path is already a local directory, it will use
+        that directly.
+        
+        Args:
+            pretrained_model_name_or_path: HuggingFace model ID (e.g., "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+                or local directory path.
+            cache_dir: Directory to cache downloaded models. If None, uses HuggingFace default.
+            force_download: Whether to force re-download even if model exists in cache.
+            local_files_only: If True, only use local files and don't attempt to download.
+            token: HuggingFace token for private models. Can also be set via HF_TOKEN env var.
+            revision: Git revision/branch/tag to download. Defaults to "main".
+            enforce_eager: Whether to enforce eager mode (disable CUDA graphs).
+            tensor_parallel_size: Number of GPUs for tensor parallelism.
+            zmq_bridge: Optional ZMQ bridge for async generation.
+        
+        Returns:
+            Qwen3TTSInterface instance.
+        
+        Example:
+            >>> # Download from HuggingFace
+            >>> interface = Qwen3TTSInterface.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+            
+            >>> # Use local path
+            >>> interface = Qwen3TTSInterface.from_pretrained("/path/to/local/model")
+            
+            >>> # With custom cache directory
+            >>> interface = Qwen3TTSInterface.from_pretrained(
+            ...     "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            ...     cache_dir="/custom/cache/dir"
+            ... )
+        """
+        # Check if it's already a local directory
+        # Also check if it's an absolute path or exists as a file/directory
+        if os.path.isdir(pretrained_model_name_or_path) or os.path.isfile(pretrained_model_name_or_path):
+            model_path = pretrained_model_name_or_path
+            if os.path.isfile(model_path):
+                # If it's a file, use the parent directory
+                model_path = os.path.dirname(model_path)
+            print(f"Using local model directory: {model_path}")
+        elif os.path.isabs(pretrained_model_name_or_path):
+            # Absolute path that doesn't exist - might be invalid
+            raise ValueError(
+                f"Model path '{pretrained_model_name_or_path}' does not exist. "
+                "Please provide a valid local path or HuggingFace model ID."
+            )
+        else:
+            # Download from HuggingFace
+            if not HAS_HF_HUB:
+                raise ImportError(
+                    "huggingface_hub is required for downloading models. "
+                    "Install it with: pip install huggingface_hub"
+                )
+            
+            if local_files_only:
+                # Try to find in cache
+                from huggingface_hub import try_to_load_from_cache
+                model_path = try_to_load_from_cache(
+                    pretrained_model_name_or_path,
+                    revision=revision or "main",
+                    cache_dir=cache_dir,
+                )
+                if model_path is None:
+                    raise ValueError(
+                        f"Model {pretrained_model_name_or_path} not found in cache and "
+                        "local_files_only=True. Please download it first or set local_files_only=False."
+                    )
+                if not os.path.isdir(model_path):
+                    # It's a file, get the parent directory
+                    model_path = os.path.dirname(model_path)
+            else:
+                print(f"Downloading model from HuggingFace: {pretrained_model_name_or_path}")
+                if revision:
+                    print(f"  Revision: {revision}")
+                if cache_dir:
+                    print(f"  Cache directory: {cache_dir}")
+                
+                model_path = snapshot_download(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    local_files_only=local_files_only,
+                    token=token or os.getenv("HF_TOKEN"),
+                    revision=revision or "main",
+                )
+                print(f"✓ Model downloaded to: {model_path}")
+        
+        # Initialize interface with the model path
+        return cls(
+            model_path=model_path,
+            enforce_eager=enforce_eager,
+            tensor_parallel_size=tensor_parallel_size,
+            zmq_bridge=zmq_bridge,
+        )
+    
     def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1, zmq_bridge=None):
         self.model_path = model_path
         self.enforce_eager = enforce_eager
@@ -127,6 +265,11 @@ class Qwen3TTSInterface:
             print(f"[Interface] Started predictor process PID={self._predictor_process.pid}")
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Initialize speech tokenizer and speaker encoder if available
+        self.speech_tokenizer = None
+        self.speaker_encoder = None
+        self._init_speech_components()
 
         # ZMQ path: asyncio queues for receiving outputs from ZMQ dispatcher
         self._request_queues: dict[str, asyncio.Queue] = {}
@@ -136,7 +279,595 @@ class Qwen3TTSInterface:
         self._zmq_tasks_started = False
         # Serialize request prep (GPU work) so event loop can run while another request prepares.
         self._prep_lock = threading.Lock()
-
+    
+    def _init_speech_components(self):
+        """Initialize speech tokenizer and speaker encoder from model if available."""
+        try:
+            # Try to load speech tokenizer
+            if HAS_SPEECH_TOKENIZER:
+                self.speech_tokenizer = SpeechTokenizer(self.model_path, dtype=torch.bfloat16)
+            
+            # Try to load speaker encoder from model
+            # Check if speaker_encoder exists in the model
+            try:
+                from qwen_tts.core.models import Qwen3TTSForConditionalGeneration
+                # Try to load just to check if speaker encoder exists
+                # We'll load it lazily when needed
+                self._speaker_encoder_available = True
+            except:
+                self._speaker_encoder_available = False
+        except Exception as e:
+            print(f"Warning: Could not initialize speech components: {e}")
+            self.speech_tokenizer = None
+            self._speaker_encoder_available = False
+    
+    def _load_speaker_encoder(self):
+        """Lazily load speaker encoder from model."""
+        if self.speaker_encoder is not None:
+            return self.speaker_encoder
+        
+        if not self._speaker_encoder_available:
+            raise RuntimeError("Speaker encoder not available for this model")
+        
+        try:
+            from qwen_tts.core.models import Qwen3TTSForConditionalGeneration
+            # Load model just to get speaker encoder
+            # This is a bit inefficient, but necessary for now
+            temp_model = Qwen3TTSForConditionalGeneration.from_pretrained(
+                self.model_path,
+                device_map="cpu",  # Load to CPU first
+            )
+            if hasattr(temp_model, 'speaker_encoder') and temp_model.speaker_encoder is not None:
+                self.speaker_encoder = temp_model.speaker_encoder.to(self.device)
+                # Get dtype from model
+                if hasattr(temp_model, 'dtype'):
+                    self.speaker_encoder = self.speaker_encoder.to(temp_model.dtype)
+                return self.speaker_encoder
+            else:
+                self._speaker_encoder_available = False
+                raise RuntimeError("Model does not have speaker_encoder")
+        except Exception as e:
+            print(f"Warning: Could not load speaker encoder: {e}")
+            self._speaker_encoder_available = False
+            raise
+    
+    def _build_ref_text(self, text: str) -> str:
+        """Build reference text format for ICL mode.
+        
+        Args:
+            text: Reference text string.
+        
+        Returns:
+            Formatted reference text string.
+        """
+        return f"<|im_start|>assistant\n{text}<|im_end|>\n"
+    
+    def _is_url(self, x: str) -> bool:
+        """Check if string is a URL."""
+        try:
+            result = urlparse(x)
+            return all([result.scheme, result.netloc])
+        except:
+            return False
+    
+    def _is_probably_base64(self, x: str) -> bool:
+        """Check if string is probably base64 encoded."""
+        try:
+            if isinstance(x, str) and len(x) > 100:
+                base64.b64decode(x.split(",")[-1] if "," in x else x)
+                return True
+        except:
+            pass
+        return False
+    
+    def _decode_base64_to_wav_bytes(self, b64: str) -> bytes:
+        """Decode base64 string to WAV bytes."""
+        if "," in b64 and b64.strip().startswith("data:"):
+            b64 = b64.split(",", 1)[1]
+        return base64.b64decode(b64)
+    
+    def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
+        """Load audio from path/URL/base64 to numpy array."""
+        if self._is_url(x):
+            with urllib.request.urlopen(x) as resp:
+                audio_bytes = resp.read()
+            with io.BytesIO(audio_bytes) as f:
+                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+        elif self._is_probably_base64(x):
+            wav_bytes = self._decode_base64_to_wav_bytes(x)
+            with io.BytesIO(wav_bytes) as f:
+                audio, sr = sf.read(f, dtype="float32", always_2d=False)
+        else:
+            audio, sr = librosa.load(x, sr=None, mono=True)
+        
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=-1)
+        
+        return audio.astype(np.float32), int(sr)
+    
+    def _normalize_audio_inputs(self, audios: Union[Any, List[Any]]) -> List[Tuple[np.ndarray, int]]:
+        """Normalize audio inputs into list of (waveform, sr) tuples.
+        
+        Supports:
+        - str: wav path / URL / base64 audio string
+        - (np.ndarray, sr): waveform + sampling rate tuple
+        - list of the above
+        """
+        if isinstance(audios, list):
+            items = audios
+        else:
+            items = [audios]
+        
+        normalized = []
+        for item in items:
+            if isinstance(item, str):
+                wav, sr = self._load_audio_to_np(item)
+                normalized.append((wav, sr))
+            elif isinstance(item, tuple) and len(item) == 2:
+                wav, sr = item
+                if isinstance(wav, torch.Tensor):
+                    wav = wav.cpu().numpy()
+                if wav.ndim > 1:
+                    wav = np.mean(wav, axis=-1)
+                normalized.append((wav.astype(np.float32), int(sr)))
+            elif isinstance(item, np.ndarray):
+                raise ValueError("numpy array provided without sampling rate. Use (np.ndarray, sr) tuple.")
+            else:
+                raise ValueError(f"Unsupported audio input type: {type(item)}")
+        
+        return normalized
+    
+    @torch.inference_mode()
+    def extract_speaker_embedding(self, audio: np.ndarray, sr: int) -> torch.Tensor:
+        """Extract speaker embedding from audio.
+        
+        Args:
+            audio: Audio waveform as numpy array.
+            sr: Sample rate (must be 24000).
+        
+        Returns:
+            Speaker embedding tensor [D].
+        """
+        assert sr == 24000, "Only support 24kHz audio"
+        
+        # Load speaker encoder if not already loaded
+        speaker_encoder = self._load_speaker_encoder()
+        
+        # Compute mel spectrogram
+        mels = self._mel_spectrogram(
+            torch.from_numpy(audio).unsqueeze(0),
+            n_fft=1024,
+            num_mels=128,
+            sampling_rate=24000,
+            hop_size=256,
+            win_size=1024,
+            fmin=0,
+            fmax=12000
+        ).transpose(1, 2)
+        
+        # Get dtype from speaker encoder
+        dtype = next(speaker_encoder.parameters()).dtype
+        speaker_embedding = speaker_encoder(mels.to(self.device).to(dtype))[0]
+        return speaker_embedding
+    
+    def _mel_spectrogram(
+        self,
+        y: torch.Tensor,
+        n_fft: int,
+        num_mels: int,
+        sampling_rate: int,
+        hop_size: int,
+        win_size: int,
+        fmin: int,
+        fmax: int = None,
+        center: bool = False,
+    ) -> torch.Tensor:
+        """Calculate mel spectrogram (from Qwen3-TTS)."""
+        device = y.device
+        
+        mel = librosa_mel_fn(
+            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
+        )
+        
+        mel_basis = torch.from_numpy(mel).float().to(device)
+        hann_window = torch.hann_window(win_size).to(device)
+        
+        padding = (n_fft - hop_size) // 2
+        y = torch.nn.functional.pad(
+            y.unsqueeze(1), (padding, padding), mode="reflect"
+        ).squeeze(1)
+        
+        spec = torch.stft(
+            y,
+            n_fft=n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=hann_window,
+            center=center,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
+        
+        # Compute magnitude: sqrt(real^2 + imag^2)
+        spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
+        
+        # Apply mel filterbank: mel_basis @ spec
+        # spec shape: [batch, freq_bins, time] or [freq_bins, time]
+        # mel_basis shape: [num_mels, freq_bins]
+        # Result: [batch, num_mels, time] or [num_mels, time]
+        mel_spec = torch.matmul(mel_basis, spec)  # matmul handles batch dimension correctly
+        
+        return mel_spec
+    
+    def _codebook_ids_to_audio(self, codebook_ids_list: List[List[int]]) -> Tuple[List[np.ndarray], int]:
+        """Convert codebook_ids chunks to audio format.
+        
+        Args:
+            codebook_ids_list: List of codebook_id chunks, each chunk is [codebook0, codebook1, ..., codebook15].
+        
+        Returns:
+            Tuple of (wavs: List[np.ndarray], sr: int).
+        """
+        if self.speech_tokenizer is None:
+            raise RuntimeError("speech_tokenizer not available. Cannot decode audio.")
+        
+        # Convert list of chunks to tensor format [batch, 16, time]
+        # Each chunk is [codebook0, codebook1, ..., codebook15]
+        # Stack chunks along time dimension
+        if not codebook_ids_list:
+            return [], self.speech_tokenizer.sample_rate
+        
+        # Convert to tensor: [time, 16]
+        codebook_tensor = torch.tensor(codebook_ids_list, dtype=torch.long)  # [time, 16]
+        
+        # Transpose to [16, time] and add batch dim -> [1, 16, time]
+        codebook_tensor = codebook_tensor.transpose(0, 1).unsqueeze(0)  # [1, 16, time]
+        
+        # Decode using speech tokenizer
+        wavs, sr = self.speech_tokenizer.decode(codebook_tensor)
+        return wavs, sr
+    
+    def create_voice_clone_prompt(
+        self,
+        ref_audio: Union[Any, List[Any]],
+        ref_text: Optional[Union[str, List[Optional[str]]]] = None,
+        x_vector_only_mode: Union[bool, List[bool]] = False,
+    ) -> Dict[str, Any]:
+        """Build voice-clone prompt items from reference audio (and optionally reference text).
+        
+        Args:
+            ref_audio: Reference audio(s). Can be:
+                - str: wav path / URL / base64
+                - (np.ndarray, sr): waveform + sampling rate tuple
+                - list of the above
+            ref_text: Reference transcript(s). Required when x_vector_only_mode=False (ICL mode).
+            x_vector_only_mode: Whether to use speaker embedding only. If False, ICL mode will be used.
+        
+        Returns:
+            voice_clone_prompt dict with keys: ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode.
+            Each value is a list (one per batch item).
+        """
+        if self.speech_tokenizer is None:
+            raise RuntimeError("speech_tokenizer not available. Cannot create voice clone prompt.")
+        
+        ref_audio_list = _ensure_list(ref_audio)
+        ref_text_list = _ensure_list(ref_text) if isinstance(ref_text, list) else ([ref_text] * len(ref_audio_list) if ref_text is not None else [None] * len(ref_audio_list))
+        xvec_list = _ensure_list(x_vector_only_mode) if isinstance(x_vector_only_mode, list) else ([x_vector_only_mode] * len(ref_audio_list))
+        
+        if len(ref_text_list) != len(ref_audio_list) or len(xvec_list) != len(ref_audio_list):
+            raise ValueError(
+                f"Batch size mismatch: ref_audio={len(ref_audio_list)}, ref_text={len(ref_text_list)}, x_vector_only_mode={len(xvec_list)}"
+            )
+        
+        normalized = self._normalize_audio_inputs(ref_audio_list)
+        
+        # Encode audio to codes
+        ref_wavs_for_code: List[np.ndarray] = []
+        ref_sr_for_code: List[int] = []
+        for wav, sr in normalized:
+            ref_wavs_for_code.append(wav)
+            ref_sr_for_code.append(sr)
+        
+        if len(set(ref_sr_for_code)) == 1:
+            # Batch encode if same sample rate
+            # Pass list of numpy arrays directly to tokenizer (not stacked tensor!)
+            enc = self.speech_tokenizer.tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
+            # enc.audio_codes is a list of [time, 16] tensors
+            ref_codes = [code.cpu() for code in enc.audio_codes]
+        else:
+            # Encode individually if different sample rates
+            ref_codes = []
+            for wav, sr in normalized:
+                # Pass numpy array directly to tokenizer
+                enc = self.speech_tokenizer.tokenizer.encode(wav, sr=sr)
+                # enc.audio_codes[0] is [time, 16]
+                ref_codes.append(enc.audio_codes[0].cpu())
+        
+        # Extract speaker embeddings and build prompt
+        ref_spk_embeddings = []
+        ref_codes_list = []
+        x_vector_only_list = []
+        icl_mode_list = []
+        
+        for i, ((wav, sr), code, rtext, xvec_only) in enumerate(zip(normalized, ref_codes, ref_text_list, xvec_list)):
+            if not xvec_only:
+                if rtext is None or rtext == "":
+                    raise ValueError(f"ref_text is required when x_vector_only_mode=False (ICL mode). Bad index={i}")
+            
+            # Resample to 24kHz for speaker encoder if needed
+            wav_resample = wav
+            if sr != 24000:
+                wav_resample = librosa.resample(
+                    y=wav_resample.astype(np.float32),
+                    orig_sr=int(sr),
+                    target_sr=24000
+                )
+            
+            # Extract speaker embedding
+            spk_emb = self.extract_speaker_embedding(audio=wav_resample, sr=24000)
+            ref_spk_embeddings.append(spk_emb)
+            
+            # Store ref_code (None if x_vector_only_mode)
+            ref_codes_list.append(None if xvec_only else code)
+            x_vector_only_list.append(bool(xvec_only))
+            icl_mode_list.append(bool(not xvec_only))
+        
+        return {
+            "ref_code": ref_codes_list,
+            "ref_spk_embedding": ref_spk_embeddings,
+            "x_vector_only_mode": x_vector_only_list,
+            "icl_mode": icl_mode_list,
+            "ref_text": ref_text_list,  # Store ref_text for later use in generate_voice_clone
+        }
+    
+    def generate_voice_clone(
+        self,
+        text: Union[str, List[str]],
+        language: Union[str, List[str]] = None,
+        ref_audio: Optional[Union[Any, List[Any]]] = None,
+        ref_text: Optional[Union[str, List[Optional[str]]]] = None,
+        x_vector_only_mode: Union[bool, List[bool]] = False,
+        voice_clone_prompt: Optional[Dict[str, Any]] = None,
+        non_streaming_mode: bool = True,
+    ) -> Tuple[List[np.ndarray], int]:
+        """Generate speech using voice clone.
+        
+        Args:
+            text: Text(s) to synthesize.
+            language: Language(s) for each sample.
+            ref_audio: Reference audio(s) for prompt building. Required if voice_clone_prompt is not provided.
+            ref_text: Reference text(s) used for ICL mode (required when x_vector_only_mode=False).
+            x_vector_only_mode: If True, only speaker embedding is used (ignores ref_text/ref_code).
+            voice_clone_prompt: Pre-built voice clone prompt dict from create_voice_clone_prompt.
+            non_streaming_mode: Using non-streaming text input.
+        
+        Returns:
+            Tuple of (wavs: List[np.ndarray], sr: int).
+        """
+        if self.zmq_bridge is not None:
+            raise RuntimeError("generate_voice_clone does not support ZMQ bridge. Use sync mode.")
+        
+        texts = _ensure_list(text)
+        languages = _ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        
+        if len(languages) == 1 and len(texts) > 1:
+            languages = languages * len(texts)
+        if len(texts) != len(languages):
+            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
+        
+        # Build or use voice_clone_prompt
+        if voice_clone_prompt is None:
+            if ref_audio is None:
+                raise ValueError("Either `voice_clone_prompt` or `ref_audio` must be provided.")
+            voice_clone_prompt = self.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode
+            )
+            if len(voice_clone_prompt["ref_spk_embedding"]) == 1 and len(texts) > 1:
+                # Expand single prompt to batch
+                for key in voice_clone_prompt:
+                    voice_clone_prompt[key] = voice_clone_prompt[key] * len(texts)
+            ref_texts_for_ids = ref_text if isinstance(ref_text, list) else ([ref_text] * len(texts) if ref_text else [None] * len(texts))
+        else:
+            # When voice_clone_prompt is provided, check if ICL mode is enabled
+            # If so, use ref_text from prompt or provided ref_text parameter
+            icl_mode_enabled = any(voice_clone_prompt.get("icl_mode", []))
+            if icl_mode_enabled:
+                # Prefer ref_text from parameter, fallback to stored ref_text in prompt
+                prompt_ref_text = voice_clone_prompt.get("ref_text")
+                if ref_text is not None:
+                    ref_texts_for_ids = ref_text if isinstance(ref_text, list) else ([ref_text] * len(texts) if ref_text else [None] * len(texts))
+                elif prompt_ref_text is not None:
+                    ref_texts_for_ids = prompt_ref_text if isinstance(prompt_ref_text, list) else ([prompt_ref_text] * len(texts) if prompt_ref_text else [None] * len(texts))
+                else:
+                    raise ValueError(
+                        "ICL mode is enabled in voice_clone_prompt but ref_text is not available. "
+                        "Please provide ref_text when creating voice_clone_prompt or when calling generate_voice_clone."
+                    )
+                # Ensure ref_texts_for_ids matches batch size
+                if len(ref_texts_for_ids) == 1 and len(texts) > 1:
+                    ref_texts_for_ids = ref_texts_for_ids * len(texts)
+                elif len(ref_texts_for_ids) != len(texts):
+                    raise ValueError(f"Batch size mismatch: ref_text={len(ref_texts_for_ids)}, text={len(texts)}")
+            else:
+                ref_texts_for_ids = None
+        
+        # Expand voice_clone_prompt if needed (single prompt for multiple texts)
+        # Make a copy to avoid modifying the original dict
+        if len(voice_clone_prompt["ref_spk_embedding"]) == 1 and len(texts) > 1:
+            # Expand single prompt to batch (copy to avoid modifying original)
+            voice_clone_prompt = {key: value * len(texts) for key, value in voice_clone_prompt.items()}
+            # Also expand ref_texts_for_ids if it exists
+            if ref_texts_for_ids is not None and len(ref_texts_for_ids) == 1:
+                ref_texts_for_ids = ref_texts_for_ids * len(texts)
+        elif len(voice_clone_prompt["ref_spk_embedding"]) != len(texts):
+            raise ValueError(f"Batch size mismatch: prompt={len(voice_clone_prompt['ref_spk_embedding'])}, text={len(texts)}")
+        
+        # Tokenize texts
+        input_texts = [f"<|im_start|>assistant\n{t}<|im_end|>\n<|im_start|>assistant\n" for t in texts]
+        input_ids = _tokenize_texts(input_texts, self.processor, self.device)
+        
+        # Tokenize ref_texts if provided (for ICL mode)
+        ref_ids = None
+        if ref_texts_for_ids is not None:
+            ref_ids = []
+            for rt in ref_texts_for_ids:
+                if rt is None or rt == "":
+                    ref_ids.append(None)
+                else:
+                    ref_tok = _tokenize_texts([self._build_ref_text(rt)], self.processor, self.device)[0]
+                    ref_ids.append(ref_tok)
+        
+        # Prepare generate_speaker_prompt_fn and generate_icl_prompt_fn
+        def generate_speaker_prompt_fn(prompt):
+            return generate_speaker_prompt(prompt, self.device)
+        
+        def generate_icl_prompt_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
+            return generate_icl_prompt(
+                text_id=text_id,
+                ref_id=ref_id,
+                ref_code=ref_code,
+                tts_pad_embed=tts_pad_embed,
+                tts_eos_embed=tts_eos_embed,
+                non_streaming_mode=non_streaming_mode,
+                config=self.model_config,
+                text_embedding=self.text_embedding,
+                input_embedding=self.input_embedding,
+                text_projection=self.text_projection,
+                code_predictor_embeddings=self.predictor_input_embeddings,
+                device=self.device,
+            )
+        
+        # Prepare inputs
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = prepare_inputs(
+            config=self.model_config,
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt,
+            languages=languages,
+            non_streaming_mode=non_streaming_mode,
+            text_embedding=self.text_embedding,
+            input_embedding=self.input_embedding,
+            text_projection=self.text_projection,
+            device=self.device,
+            generate_speaker_prompt_fn=generate_speaker_prompt_fn,
+            generate_icl_prompt_fn=generate_icl_prompt_fn,
+        )
+        
+        # Generate codebook_ids for all batches
+        # Process each batch item separately
+        wavs_all = []
+        sr = None
+        
+        for batch_idx in range(talker_input_embeds.shape[0]):
+            batch_embeds = talker_input_embeds[batch_idx:batch_idx+1]
+            batch_trailing = trailing_text_hiddens[batch_idx:batch_idx+1]
+            batch_pad = tts_pad_embed
+            
+            # Collect all codebook_id chunks for this batch item
+            batch_codebook_ids = []
+            for chunk in self._generate_caller_driven(
+                batch_embeds, batch_trailing, batch_pad,
+                str(uuid.uuid4()),
+                SamplingParams(temperature=1.0, max_tokens=1),
+                SamplingParams(temperature=0.9, max_tokens=17),
+            ):
+                batch_codebook_ids.append(chunk)
+            
+            # Convert to audio for this batch item
+            if batch_codebook_ids:
+                wavs, sr = self._codebook_ids_to_audio(batch_codebook_ids)
+                wavs_all.extend(wavs)
+        
+        return wavs_all, sr
+    
+    def generate_voice_design(
+        self,
+        text: Union[str, List[str]],
+        instruct: Union[str, List[str]],
+        language: Union[str, List[str]] = None,
+        non_streaming_mode: bool = True,
+    ) -> Tuple[List[np.ndarray], int]:
+        """Generate speech with voice design using natural-language style instructions.
+        
+        Args:
+            text: Text(s) to synthesize.
+            instruct: Instruction(s) describing desired voice/style.
+            language: Language(s) for each sample.
+            non_streaming_mode: Using non-streaming text input.
+        
+        Returns:
+            Tuple of (wavs: List[np.ndarray], sr: int).
+        """
+        if self.zmq_bridge is not None:
+            raise RuntimeError("generate_voice_design does not support ZMQ bridge. Use sync mode.")
+        
+        texts = _ensure_list(text)
+        languages = _ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        instructs = _ensure_list(instruct)
+        
+        if len(languages) == 1 and len(texts) > 1:
+            languages = languages * len(texts)
+        if len(instructs) == 1 and len(texts) > 1:
+            instructs = instructs * len(texts)
+        
+        if not (len(texts) == len(languages) == len(instructs)):
+            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}")
+        
+        # Prepare prompts
+        input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
+            text=texts,
+            speaker=[""] * len(texts),  # Voice design doesn't use speakers
+            language=languages,
+            instruct=instructs,
+            processor=self.processor,
+            device=self.device,
+        )
+        
+        # Prepare inputs
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = prepare_inputs(
+            config=self.model_config,
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=languages,
+            speakers=speakers,
+            non_streaming_mode=non_streaming_mode,
+            text_embedding=self.text_embedding,
+            input_embedding=self.input_embedding,
+            text_projection=self.text_projection,
+            device=self.device,
+        )
+        
+        # Generate codebook_ids for all batches
+        # Process each batch item separately
+        wavs_all = []
+        sr = None
+        
+        for batch_idx in range(talker_input_embeds.shape[0]):
+            batch_embeds = talker_input_embeds[batch_idx:batch_idx+1]
+            batch_trailing = trailing_text_hiddens[batch_idx:batch_idx+1]
+            batch_pad = tts_pad_embed
+            
+            # Collect all codebook_id chunks for this batch item
+            batch_codebook_ids = []
+            for chunk in self._generate_caller_driven(
+                batch_embeds, batch_trailing, batch_pad,
+                str(uuid.uuid4()),
+                SamplingParams(temperature=1.0, max_tokens=1),
+                SamplingParams(temperature=0.9, max_tokens=17),
+            ):
+                batch_codebook_ids.append(chunk)
+            
+            # Convert to audio for this batch item
+            if batch_codebook_ids:
+                wavs, sr = self._codebook_ids_to_audio(batch_codebook_ids)
+                wavs_all.extend(wavs)
+        
+        return wavs_all, sr
+    
     async def start_zmq_tasks(self) -> None:
         """Start the ZMQ dispatcher (thread + asyncio task). Engine loops run in separate processes. Call once before generate_async when zmq_bridge is set."""
         if self.zmq_bridge is None:
@@ -460,6 +1191,10 @@ class Qwen3TTSInterface:
 
 
 if __name__ == "__main__":
+    # Example: Use HuggingFace model ID (automatically downloads if needed)
+    # interface = Qwen3TTSInterface.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    
+    # Or use local path
     interface = Qwen3TTSInterface(model_path="/work/weights/qwen3tts")
     print("Warm up...")
     audio_codes = list(interface.generate_custom_voice(text="Hi there this is a test.", language="English", speaker="Vivian"))

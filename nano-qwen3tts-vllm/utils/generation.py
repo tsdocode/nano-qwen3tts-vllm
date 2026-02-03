@@ -13,7 +13,7 @@ callables and device (no talker).
 from __future__ import annotations
 
 import torch
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List
 
 def prepare_inputs(
     config,
@@ -231,6 +231,11 @@ def prepare_inputs(
                 raise ValueError(
                     "ICL mode requested but generate_icl_prompt_fn was not provided"
                 )
+            if ref_ids is None or ref_ids[index] is None:
+                raise ValueError(
+                    f"ICL mode requires ref_ids, but ref_ids[{index}] is None. "
+                    "Please provide ref_text when creating voice_clone_prompt or when calling generate_voice_clone."
+                )
             icl_input_embed, trailing_text_hidden = generate_icl_prompt_fn(
                 text_id=input_id[:, 3:-5],
                 ref_id=ref_ids[index][:, 3:-2],
@@ -363,3 +368,139 @@ def prepare_inputs(
         tts_pad_embed,
         talker_attention_mask,
     )
+
+
+def generate_speaker_prompt(
+    voice_clone_prompt: dict,
+    device: Union[torch.device, str],
+    dtype: Optional[torch.dtype] = None,
+) -> List[torch.Tensor]:
+    """Generate speaker embeddings from voice_clone_prompt.
+    
+    Extracts ref_spk_embedding from voice_clone_prompt and moves to device/dtype.
+    
+    Args:
+        voice_clone_prompt: Dict with 'ref_spk_embedding' key containing list of tensors.
+        device: Target device for embeddings.
+        dtype: Target dtype for embeddings (optional, uses original dtype if None).
+    
+    Returns:
+        List of speaker embedding tensors, one per batch item.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    voice_clone_spk_embeds = []
+    for index in range(len(voice_clone_prompt['ref_spk_embedding'])):
+        ref_spk_embedding = voice_clone_prompt["ref_spk_embedding"][index].to(device)
+        if dtype is not None:
+            ref_spk_embedding = ref_spk_embedding.to(dtype)
+        voice_clone_spk_embeds.append(ref_spk_embedding)
+    
+    return voice_clone_spk_embeds
+
+
+def generate_icl_prompt(
+    text_id: torch.Tensor,
+    ref_id: torch.Tensor,
+    ref_code: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+    tts_eos_embed: torch.Tensor,
+    non_streaming_mode: bool,
+    config,
+    text_embedding: Callable,
+    input_embedding: Callable,
+    text_projection: Callable,
+    code_predictor_embeddings: List[Callable],
+    device: Union[torch.device, str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate ICL (in-context learning) prompt embeddings.
+    
+    Creates ICL prompt by combining reference text + target text embeddings with
+    reference codec embeddings.
+    
+    Args:
+        text_id: Target text token IDs [1, T_text].
+        ref_id: Reference text token IDs [1, T_ref].
+        ref_code: Reference codec tokens [1, T_code, num_code_groups] or [1, T_code].
+        tts_pad_embed: TTS pad embedding [1, 1, D].
+        tts_eos_embed: TTS EOS embedding [1, 1, D].
+        non_streaming_mode: Whether to use non-streaming mode.
+        config: Config with talker_config containing codec token IDs.
+        text_embedding: Callable that takes token IDs and returns text embeddings.
+        input_embedding: Callable that takes token IDs and returns codec embeddings (for codebook 0).
+        text_projection: Callable that projects text embeddings.
+        code_predictor_embeddings: List of callables for codebooks 1-15.
+        device: Device for creating tensors.
+    
+    Returns:
+        Tuple of (icl_input_embed, trailing_text_hidden).
+        - icl_input_embed: [1, T_icl, D] ICL input embeddings.
+        - trailing_text_hidden: [1, T_trailing, D] or [1, 1, D] trailing hidden state.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    num_code_groups = config.talker_config.num_code_groups
+    
+    # Text embed (ref id + text id + eos) [1, T1, D]
+    text_embed = text_projection(
+        text_embedding(torch.cat([ref_id, text_id], dim=-1))
+    )
+    text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
+    
+    # Codec embed (codec bos + codec) [1, T2, D]
+    # ref_code is [1, num_code_groups] format (first timestep only for ICL prompt)
+    # Match original implementation: ref_code[:, :1] for codebook 0, ref_code[:, i:i+1] for codebook i
+    codec_embed = []
+    for i in range(num_code_groups):
+        if i == 0:
+            # Use input_embedding for codebook 0
+            # ref_code[:, :1] takes codebook 0 -> [1, 1]
+            codec_embed.append(input_embedding(ref_code[:, :1]))
+        else:
+            # Use code_predictor_embeddings for codebooks 1-15
+            # ref_code[:, i:i+1] takes codebook i -> [1, 1]
+            if i - 1 < len(code_predictor_embeddings):
+                codec_embed.append(code_predictor_embeddings[i - 1](ref_code[:, i:i+1]))
+            else:
+                # Fallback: use input_embedding if not enough code_predictor_embeddings
+                codec_embed.append(input_embedding(ref_code[:, i:i+1]))
+    
+    # Each codec_embed[i] is [1, 1, D] (one codebook embedding)
+    # Cat along dim=1 gives [1, num_code_groups, D], sum(1) gives [1, D], unsqueeze(0) gives [1, 1, D]
+    codec_embed = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)  # [1, 1, D]
+    
+    # Prepend codec_bos_id
+    codec_bos_embed = input_embedding(
+        torch.tensor(
+            [[config.talker_config.codec_bos_id]],
+            device=device,
+            dtype=text_id.dtype,
+        )
+    )
+    codec_embed = torch.cat([codec_bos_embed, codec_embed], dim=1)
+    
+    # Compute lengths
+    text_lens = text_embed.shape[1]
+    codec_lens = codec_embed.shape[1]
+    
+    if non_streaming_mode:
+        # Add codec_pad_id to text_embed
+        icl_input_embed = text_embed + input_embedding(
+            torch.tensor(
+                [[config.talker_config.codec_pad_id] * text_lens],
+                device=device,
+                dtype=text_id.dtype,
+            )
+        )
+        # Concatenate with codec_embed + tts_pad_embed
+        icl_input_embed = torch.cat([icl_input_embed, codec_embed + tts_pad_embed], dim=1)
+        return icl_input_embed, tts_pad_embed
+    else:
+        # Streaming mode: align text and codec lengths
+        if text_lens > codec_lens:
+            return text_embed[:, :codec_lens] + codec_embed, text_embed[:, codec_lens:]
+        else:
+            text_embed = torch.cat([text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1)
+            return text_embed + codec_embed, tts_pad_embed
