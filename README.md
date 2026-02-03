@@ -62,6 +62,8 @@ nano-qwen3tts-vllm supports **all three Qwen3-TTS model types**:
 
 All models support both **12Hz** (default, faster) and **25Hz** (higher quality) variants.
 
+> 💡 **For complete, runnable examples**, see the [`examples/`](examples/) directory. Each example includes detailed usage instructions and demonstrates all features.
+
 ## Usage
 
 ### 1. Custom Voice (Pre-defined Speakers)
@@ -229,6 +231,8 @@ python examples/server.py
 *(CCU = concurrent request / “concurrent chunk unit” in your setup.)*
 
 ## Examples
+
+> 📁 **See [`examples/`](examples/) for complete, runnable code!**
 
 Comprehensive example scripts are provided in the [`examples/`](examples/) directory:
 
