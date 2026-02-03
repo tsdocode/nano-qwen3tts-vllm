@@ -27,6 +27,14 @@ Tested on NVIDIA H100 with `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` with script `e
 | **Avg Generation Time** | 2.612s | 8.487s | **3.25x faster** |
 | **Real-Time Factor (RTF)** | 0.399 | 1.467 | **3.68x better** |
 
+
+Tested on NVIDIA L4 with `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` with script `examples/quick_benchmark.py`:
+| Metric | nano-vllm | Original Qwen3-TTS | Improvement |
+|--------|-----------|-------------------|-------------|
+| **Avg Generation Time** | 4.319s | 16.613s | **3.85x faster** |
+| **Real-Time Factor (RTF)** | 0.742 | 3.311 | **4.46x better** |
+
+
 **Key Findings:**
 - 🚀 **4.86x faster** generation speed
 - 📊 **RTF < 0.4** means nano-vllm generates audio **2.8x faster than real-time**

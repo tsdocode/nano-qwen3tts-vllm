@@ -279,6 +279,28 @@ class Qwen3TTSInterface:
         self._zmq_tasks_started = False
         # Serialize request prep (GPU work) so event loop can run while another request prepares.
         self._prep_lock = threading.Lock()
+
+    def shutdown(self):
+        """Explicitly release GPU resources (models, KV cache, CUDA graphs).
+
+        Call this before deleting the interface to free VRAM. Without it,
+        resources are only released at process exit via atexit.
+        """
+        self.text_embedding = None
+        self.input_embedding = None
+        self.text_projection = None
+        self.predictor_input_embeddings = None
+        if self.talker_llm is not None:
+            self.talker_llm.exit()
+            self.talker_llm = None
+        if self.predictor_llm is not None:
+            self.predictor_llm.exit()
+            self.predictor_llm = None
+        self.speech_tokenizer = None
+        self.speaker_encoder = None
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
     
     def _init_speech_components(self):
         """Initialize speech tokenizer and speaker encoder from model if available."""
