@@ -2,7 +2,7 @@
 
 Env:
   USE_ZMQ=1              - Use ZMQ (async engine loop + async queue).
-  QWEN3_TTS_MODEL_PATH   - Model directory.
+  QWEN3_TTS_MODEL_PATH   - Model directory or HuggingFace model ID (e.g., Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice).
   HOST, PORT             - Server bind address.
 """
 
@@ -47,17 +47,51 @@ def get_interface():
     global _interface, _zmq_bridge
     if _interface is None:
         from nano_qwen3tts_vllm.interface import Qwen3TTSInterface
-        model_path = os.environ.get("QWEN3_TTS_MODEL_PATH", "/home/sang/work/weights/qwen3tts")
-        if _use_zmq():
-            from nano_qwen3tts_vllm.zmq import ZMQOutputBridge
-            _zmq_bridge = ZMQOutputBridge()
-            _interface = Qwen3TTSInterface(
-                model_path=model_path,
-                zmq_bridge=_zmq_bridge,
-                enforce_eager=False,
-            )
+        model_path = os.environ.get("QWEN3_TTS_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        
+        # Check if it's a local path or HuggingFace model ID
+        import os as os_module
+        if os_module.isdir(model_path) or os_module.isfile(model_path):
+            # Local path - use regular init
+            if _use_zmq():
+                from nano_qwen3tts_vllm.zmq import ZMQOutputBridge
+                import warnings
+                # Auto-find port if default is in use
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    _zmq_bridge = ZMQOutputBridge(auto_find_port=True)
+                    if w:
+                        for warning in w:
+                            logger.warning(str(warning.message))
+                _interface = Qwen3TTSInterface(
+                    model_path=model_path,
+                    zmq_bridge=_zmq_bridge,
+                    enforce_eager=False,
+                )
+            else:
+                _interface = Qwen3TTSInterface(model_path=model_path)
         else:
-            _interface = Qwen3TTSInterface(model_path=model_path)
+            # HuggingFace model ID - use from_pretrained
+            if _use_zmq():
+                from nano_qwen3tts_vllm.zmq import ZMQOutputBridge
+                import warnings
+                # Auto-find port if default is in use
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    _zmq_bridge = ZMQOutputBridge(auto_find_port=True)
+                    if w:
+                        for warning in w:
+                            logger.warning(str(warning.message))
+                _interface = Qwen3TTSInterface.from_pretrained(
+                    pretrained_model_name_or_path=model_path,
+                    zmq_bridge=_zmq_bridge,
+                    enforce_eager=False,
+                )
+            else:
+                _interface = Qwen3TTSInterface.from_pretrained(
+                    pretrained_model_name_or_path=model_path,
+                    enforce_eager=False,
+                )
     return _interface
 
 
