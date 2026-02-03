@@ -17,6 +17,7 @@ dependencies = [
     "transformers>=4.57.3",
     "pyzmq>=27.1.0",
     "asyncio>=4.0.0",
+    "xxhash>=3.6.0",
 ]
 
 [tool.setuptools.package-dir]
