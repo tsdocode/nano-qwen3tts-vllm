@@ -52,11 +52,13 @@ pip install -e .
 
 nano-qwen3tts-vllm supports **all three Qwen3-TTS model types**:
 
-| Model Type | Model ID | Generation Types Supported |
-|------------|----------|---------------------------|
-| **CustomVoice** | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | Pre-defined speakers |
-| **VoiceDesign** | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Voice design from text description |
-| **Base** | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Voice cloning from reference audio |
+| Model | Features | Language Support | Streaming | Instruction Control |
+|---|---|---|---|---|
+| Qwen3-TTS-12Hz-1.7B-VoiceDesign | Performs voice design based on user-provided descriptions. | Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian | ✅ | ✅ |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice | Provides style control over target timbres via user instructions; supports 9 premium timbres covering various combinations of gender, age, language, and dialect. | Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian | ✅ | ✅ |
+| Qwen3-TTS-12Hz-1.7B-Base | Base model capable of 3-second rapid voice clone from user audio input; can be used for fine-tuning (FT) other models. | Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian | ✅ |  |
+| Qwen3-TTS-12Hz-0.6B-CustomVoice | Supports 9 premium timbres covering various combinations of gender, age, language, and dialect. | Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian | ✅ |  |
+| Qwen3-TTS-12Hz-0.6B-Base | Base model capable of 3-second rapid voice clone from user audio input; can be used for fine-tuning (FT) other models. | Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian | ✅ |  |
 
 All models support both **12Hz** (default, faster) and **25Hz** (higher quality) variants.
 
