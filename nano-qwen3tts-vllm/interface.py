@@ -168,6 +168,16 @@ class Qwen3TTSInterface:
         self.enforce_eager = enforce_eager
         self.tensor_parallel_size = tensor_parallel_size
         self.zmq_bridge = zmq_bridge
+        self.talker_llm = TalkerLLM(model_path, enforce_eager=False, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.3)
+        self.predictor_llm = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.4)
+        self.processor = _get_processor(model_path)
+        self.model_config = self.talker_llm.model_runner.full_config
+        
+        self.text_embedding = self.talker_llm.model_runner.model.get_text_embeddings()
+        self.input_embedding = self.talker_llm.model_runner.model.get_input_embeddings()
+        self.text_projection = self.talker_llm.model_runner.model.text_projection
+        
+        self.predictor_input_embeddings = self.predictor_llm.model_runner.model.model.codec_embedding
         
         # For sync mode (non-ZMQ): initialize engines in main process
         if zmq_bridge is None:
@@ -635,7 +645,10 @@ class Qwen3TTSInterface:
             wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
         """
         if self.zmq_bridge is not None:
-            raise RuntimeError("generate_voice_clone does not support ZMQ bridge. Use sync mode.")
+            raise RuntimeError(
+                "When using ZMQ bridge, use async API: await interface.start_zmq_tasks(); "
+                "async for chunk in interface.generate_voice_clone_async(...)"
+            )
         
         if language is None:
             language = "Auto"
@@ -730,6 +743,147 @@ class Qwen3TTSInterface:
             SamplingParams(temperature=1.0, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
+    
+    async def generate_voice_clone_async(
+        self,
+        text: str,
+        language: str = None,
+        ref_audio: Optional[Any] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
+        voice_clone_prompt: Optional[Dict[str, Any]] = None,
+        non_streaming_mode: bool = True,
+    ):
+        """Async generator of codebook_id chunks for voice clone. Requires zmq_bridge; call await start_zmq_tasks() first.
+        
+        This is an async generator that yields codebook_id chunks. Use SpeechTokenizer to decode.
+        
+        Args:
+            text: Text to synthesize (single string only, no batch support).
+            language: Language for the sample (default: "Auto").
+            ref_audio: Reference audio for prompt building. Required if voice_clone_prompt is not provided.
+            ref_text: Reference transcript used for ICL mode (required when x_vector_only_mode=False).
+            x_vector_only_mode: If True, only speaker embedding is used (ignores ref_text/ref_code).
+            voice_clone_prompt: Pre-built voice clone prompt dict from create_voice_clone_prompt.
+            non_streaming_mode: Using non-streaming text input.
+        
+        Yields:
+            Codebook ID chunks (List[int]). Use SpeechTokenizer.decode() to convert to audio.
+            
+        Example:
+            await interface.start_zmq_tasks()
+            chunks = []
+            async for chunk in interface.generate_voice_clone_async(text="Hello", voice_clone_prompt=prompt):
+                chunks.append(chunk)
+            wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
+        """
+        if self.zmq_bridge is None:
+            raise RuntimeError("generate_voice_clone_async requires zmq_bridge")
+        
+        if language is None:
+            language = "Auto"
+        
+        def _prep_in_thread() -> tuple:
+            """Run prep in executor so event loop can run engine_loop; lock serializes GPU prep."""
+            with self._prep_lock:
+                # Build or use voice_clone_prompt
+                # Capture outer scope variables to avoid UnboundLocalError
+                vc_prompt = voice_clone_prompt
+                if vc_prompt is None:
+                    if ref_audio is None:
+                        raise ValueError("Either `voice_clone_prompt` or `ref_audio` must be provided.")
+                    vc_prompt = self.create_voice_clone_prompt(
+                        ref_audio=ref_audio,
+                        ref_text=ref_text,
+                        x_vector_only_mode=x_vector_only_mode
+                    )
+                    ref_text_for_ids = ref_text
+                else:
+                    # When voice_clone_prompt is provided, check if ICL mode is enabled
+                    # If so, use ref_text from prompt or provided ref_text parameter
+                    icl_mode_enabled = vc_prompt.get("icl_mode", False)
+                    if icl_mode_enabled:
+                        # Prefer ref_text from parameter, fallback to stored ref_text in prompt
+                        prompt_ref_text = vc_prompt.get("ref_text")
+                        if ref_text is not None:
+                            ref_text_for_ids = ref_text
+                        elif prompt_ref_text is not None:
+                            ref_text_for_ids = prompt_ref_text
+                        else:
+                            raise ValueError(
+                                "ICL mode is enabled in voice_clone_prompt but ref_text is not available. "
+                                "Please provide ref_text when creating voice_clone_prompt or when calling generate_voice_clone_async."
+                            )
+                    else:
+                        ref_text_for_ids = None
+                
+                # Tokenize text
+                input_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+                input_ids = _tokenize_texts([input_text], self.processor, self.device)
+                
+                # Tokenize ref_text if provided (for ICL mode)
+                ref_ids = None
+                if ref_text_for_ids is not None and ref_text_for_ids != "":
+                    ref_tok = _tokenize_texts([self._build_ref_text(ref_text_for_ids)], self.processor, self.device)[0]
+                    ref_ids = [ref_tok]
+                
+                # Prepare voice_clone_prompt as lists (for compatibility with prepare_inputs which expects batch format)
+                voice_clone_prompt_lists = {
+                    "ref_code": [vc_prompt["ref_code"]],
+                    "ref_spk_embedding": [vc_prompt["ref_spk_embedding"]],
+                    "x_vector_only_mode": [vc_prompt["x_vector_only_mode"]],
+                    "icl_mode": [vc_prompt["icl_mode"]],
+                }
+                
+                # Prepare generate_speaker_prompt_fn and generate_icl_prompt_fn
+                def generate_speaker_prompt_fn(prompt):
+                    return generate_speaker_prompt(prompt, self.device)
+                
+                def generate_icl_prompt_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
+                    return generate_icl_prompt(
+                        text_id=text_id,
+                        ref_id=ref_id,
+                        ref_code=ref_code,
+                        tts_pad_embed=tts_pad_embed,
+                        tts_eos_embed=tts_eos_embed,
+                        non_streaming_mode=non_streaming_mode,
+                        config=self.model_config,
+                        text_embedding=self.text_embedding,
+                        input_embedding=self.input_embedding,
+                        text_projection=self.text_projection,
+                        code_predictor_embeddings=self.predictor_input_embeddings,
+                        device=self.device,
+                    )
+                
+                # Prepare inputs
+                return prepare_inputs(
+                    config=self.model_config,
+                    input_ids=input_ids,
+                    ref_ids=ref_ids,
+                    voice_clone_prompt=voice_clone_prompt_lists,
+                    languages=[language],
+                    non_streaming_mode=non_streaming_mode,
+                    text_embedding=self.text_embedding,
+                    input_embedding=self.input_embedding,
+                    text_projection=self.text_projection,
+                    device=self.device,
+                    generate_speaker_prompt_fn=generate_speaker_prompt_fn,
+                    generate_icl_prompt_fn=generate_icl_prompt_fn,
+                )
+        
+        loop = asyncio.get_event_loop()
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = await loop.run_in_executor(
+            None, _prep_in_thread
+        )
+        
+        c = 0
+        async for chunk in self.generate_async(
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
+        ):
+            yield chunk
+            c +=1
+            if c>1:
+                break
     
     def generate_voice_design(
         self,
@@ -846,6 +1000,14 @@ class Qwen3TTSInterface:
         
         t1 = asyncio.create_task(run_dispatch_loop(self._zmq_inbox, self._request_queues, self._queues_lock))
         self._zmq_tasks.append(t1)
+        from nano_qwen3tts_vllm.zmq.engine_loop import run_talker_loop, run_predictor_loop
+        # Dedicated thread for blocking ZMQ recv (so it is already waiting before first publish)
+        _, inbox = start_dispatcher_thread(self.zmq_bridge.bind_address)
+        self._zmq_inbox = inbox
+        t1 = asyncio.create_task(run_dispatch_loop(inbox, self._request_queues, self._queues_lock))
+        t2 = asyncio.create_task(run_talker_loop(self.talker_llm, self.zmq_bridge))
+        t3 = asyncio.create_task(run_predictor_loop(self.predictor_llm, self.zmq_bridge))
+        self._zmq_tasks.extend([t1, t2, t3])
         # Give the recv thread time to connect and enter recv (avoid ZMQ slow-joiner)
         await asyncio.sleep(0.2)
 

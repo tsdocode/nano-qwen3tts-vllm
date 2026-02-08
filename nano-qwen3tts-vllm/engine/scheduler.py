@@ -1,9 +1,11 @@
+import logging
 from collections import deque
-
+import time
 from nano_qwen3tts_vllm.config import Config
 from nano_qwen3tts_vllm.engine.sequence import Sequence, SequenceStatus
 from nano_qwen3tts_vllm.engine.block_manager import BlockManager
 
+logger = logging.getLogger(__name__)
 
 class Scheduler:
 
@@ -22,33 +24,13 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
-                print(f"num_batched_tokens: {num_batched_tokens}")
-                print(f"len(seq): {len(seq)}")
-                print(f"max_num_batched_tokens: {self.max_num_batched_tokens}")
-                print(f"block_manager.can_allocate(seq): {self.block_manager.can_allocate(seq)}")
-                print(f"seq.num_blocks: {seq.num_blocks}")
-                print(f"seq.num_tokens: {seq.num_tokens}")
-                print(f"Breaking prefill because of batch size or block manager")
-                break
-            num_seqs += 1
-            self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
-            seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            return scheduled_seqs, True
 
-        # decode
+        # decode (priority)
         while self.running and num_seqs < self.max_num_seqs:
+            logger.info(f"[scheduler] Running sequences: {len(self.running)}")
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -60,10 +42,29 @@ class Scheduler:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-    
+
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs))
+            logger.info(f"[scheduler] Scheduled {len(scheduled_seqs)} sequences for decode")
+            return scheduled_seqs, False
+
+        # prefill
+        while self.waiting and num_seqs < self.max_num_seqs:
+            logger.info(f"[scheduler] Waiting sequences: {len(self.waiting)}")
+            seq = self.waiting[0]
+            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+                break
+            num_seqs += 1
+            self.block_manager.allocate(seq)
+            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            seq.status = SequenceStatus.RUNNING
+            self.waiting.popleft()
+            self.running.append(seq)
+            scheduled_seqs.append(seq)
+
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        logger.info(f"[scheduler] Scheduled {len(scheduled_seqs)} sequences for prefill")
+        return scheduled_seqs, True
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING

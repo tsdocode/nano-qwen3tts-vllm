@@ -62,10 +62,10 @@ def _request_one(args, url: str, payload: dict, idx: int) -> tuple[int, bytes | 
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-TTS client: generate speech and save to WAV")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Server base URL")
-    parser.add_argument("--text", default="Hi there, this is a test.", help="Text to synthesize")
+    parser.add_argument("--base-url", default="http://localhost:8000", help="Server base URL")
+    parser.add_argument("--text", default="Our firm has helped people recover millions of dollars, and I'd like to see if we can help you.", help="Text to synthesize")
     parser.add_argument("--language", default="English", help="Language of the text")
-    parser.add_argument("--speaker", default="Vivian", help="Speaker name")
+    parser.add_argument("--speaker", default="Anna", help="Speaker name")
     parser.add_argument("-o", "--output", default="output.wav", help="Output WAV file path")
     parser.add_argument(
         "-j", "--parallel",
@@ -89,6 +89,8 @@ def main():
         "language": args.language,
         "speaker": args.speaker,
     }
+    
+    print(payload)
 
     n = args.requests
     njobs = min(args.parallel, n)

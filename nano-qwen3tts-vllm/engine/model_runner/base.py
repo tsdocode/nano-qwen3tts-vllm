@@ -15,6 +15,10 @@ from nano_qwen3tts_vllm.utils.context import set_context, get_context, reset_con
 from nano_qwen3tts_vllm.config import Qwen3TTSConfig
 from nano_qwen3tts_vllm.models.qwen3_tts_talker import Qwen3TTSTalkerForCausalLM
 from nano_qwen3tts_vllm.models.qwen3_tts_predictor import Qwen3TTSCodePredictorForCausalLM
+import logging
+logger = logging.getLogger(__name__)
+
+
 
 MODEL_TYPE_MAPPING = {
     "talker": Qwen3TTSTalkerForCausalLM,

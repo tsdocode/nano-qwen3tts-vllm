@@ -7,6 +7,10 @@ from nano_qwen3tts_vllm.engine.model_runner.talker_mode_runner import TalkerMode
 
 
 from nano_qwen3tts_vllm.config import Config
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class TalkerScheduler(Scheduler):
     def __init__(self, config: Config):
@@ -30,6 +34,7 @@ class TalkerScheduler(Scheduler):
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
+            logger.info(f"[talker scheduler] Scheduled {len(scheduled_seqs)} sequences for prefill")
             return scheduled_seqs, True
 
         # decode: only schedule seqs that have decode_input_embeds set (interface has fed next input)
@@ -56,6 +61,7 @@ class TalkerScheduler(Scheduler):
         if not scheduled_seqs:
             return [], False
         self.running.extendleft(reversed(scheduled_seqs))
+        logger.info(f"[talker scheduler] Scheduled {len(scheduled_seqs)} sequences for decode")
         return scheduled_seqs, False
 
     def clear_request(self, request_id: str):
@@ -63,6 +69,8 @@ class TalkerScheduler(Scheduler):
             seq = self.request_id_to_seq.pop(request_id)
             self.block_manager.deallocate(seq)
             if seq in self.running:
+
+
                 self.running.remove(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], hidden_states: list[torch.Tensor]):

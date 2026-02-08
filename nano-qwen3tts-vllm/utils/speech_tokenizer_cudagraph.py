@@ -68,7 +68,7 @@ class SpeechTokenizerCUDAGraph:
         model_path: str,
         device: str = None,
         dtype: torch.dtype = torch.bfloat16,
-        num_graph_lengths: int = 50,
+        num_graph_lengths: int = 1,
     ):
         """Load tokenizer and capture CUDA graphs for decoder.
 
