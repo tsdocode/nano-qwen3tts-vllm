@@ -163,7 +163,7 @@ async def lifespan(app: FastAPI):
 
     # Batch=8 warmup (compiles kernels for larger matmul shapes)
     logger.info("[warmup] batch=8 ...")
-    await asyncio.gather(*[_warmup_one(warmup_req) for _ in range(8)])
+    await asyncio.gather(*[_warmup_one(warmup_req) for _ in range(16)])
     logger.info("[warmup] done.")
 
     yield
