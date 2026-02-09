@@ -22,9 +22,154 @@ from nano_qwen3tts_vllm.processor import Qwen3TTSProcessor
 from nano_qwen3tts_vllm.utils.generation import prepare_inputs, generate_speaker_prompt, generate_icl_prompt
 from nano_qwen3tts_vllm.llm import TalkerLLM, PredictorLLM
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
+from nano_qwen3tts_vllm.config import Qwen3TTSConfig
+import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _estimate_model_params(cfg) -> int:
+    """Estimate total parameter count from a model config (Talker or Predictor)."""
+    h = cfg.hidden_size
+    i = cfg.intermediate_size
+    n_layers = cfg.num_hidden_layers
+    n_heads = cfg.num_attention_heads
+    n_kv = cfg.num_key_value_heads
+    head_dim = getattr(cfg, 'head_dim', None) or (h // n_heads)
+
+    # Per layer: Q + K + V + O projections + MLP (gate, up, down) + 2 norms
+    qkvo = h * (n_heads * head_dim) + h * (n_kv * head_dim) * 2 + (n_heads * head_dim) * h
+    mlp = h * i * 3  # gate_proj + up_proj + down_proj
+    norms = h * 2  # 2 RMSNorm per layer
+    per_layer = qkvo + mlp + norms
+
+    # Embeddings
+    vocab = getattr(cfg, 'vocab_size', 0) * h
+    # LM head (often tied, but count conservatively)
+    lm_head = h * getattr(cfg, 'vocab_size', 0)
+
+    return n_layers * per_layer + vocab + lm_head
+
+
+def _kv_block_bytes(cfg, block_size: int = 256, dtype_bytes: int = 2) -> int:
+    """KV cache memory per block for a model: 2 (K+V) * layers * block * kv_heads * head_dim * dtype."""
+    n_kv = cfg.num_key_value_heads
+    head_dim = getattr(cfg, 'head_dim', None) or (cfg.hidden_size // cfg.num_attention_heads)
+    return 2 * cfg.num_hidden_layers * block_size * n_kv * head_dim * dtype_bytes
+
+
+def _compute_memory_split(
+    model_path: str,
+    gpu_memory_utilization: float,
+    kvcache_block_size: int = 256,
+) -> dict:
+    """Compute per-model memory settings so both fit within the user's target.
+
+    The user passes ONE number (e.g. 0.9 or 0.3) and this function figures out
+    how to split VRAM between Talker and Predictor.
+
+    Always uses process_gpu_memory_fraction so that each server process only
+    sees its OWN memory via torch.cuda.memory_allocated(), not the whole GPU.
+    This means you can start multiple independent servers on the same GPU
+    (e.g. 2 servers with gpu_memory_utilization=0.3 each) and they just work.
+
+    Strategy:
+      1. Set process_gpu_memory_fraction = gpu_memory_utilization.
+         This gives this process an "effective_total" = total * fraction.
+         The KV cache formula then uses per-process memory accounting.
+      2. Within that budget, calculate talker_util (fraction of effective_total
+         the talker should claim). Predictor gets the rest (pred_util=1.0).
+      3. Both models get an equal number of KV cache blocks.
+
+    Returns:
+        dict with: talker_util, pred_util, process_gpu_memory_fraction
+    """
+    with open(os.path.join(model_path, "config.json"), "r") as f:
+        raw_cfg = json.load(f)
+    full_cfg = Qwen3TTSConfig(**raw_cfg)
+    talker_cfg = full_cfg.talker_config
+    pred_cfg = full_cfg.talker_config.code_predictor_config
+
+    dtype_bytes = 2  # bf16
+
+    # ── Estimate model weight bytes ──
+    talker_weight_bytes = _estimate_model_params(talker_cfg) * dtype_bytes
+    pred_weight_bytes = _estimate_model_params(pred_cfg) * dtype_bytes
+
+    # Talker has extra embeddings: text_embedding (text_vocab * text_hidden) + text_projection
+    text_vocab = getattr(talker_cfg, 'text_vocab_size', 151936)
+    text_hidden = getattr(talker_cfg, 'text_hidden_size', 2048)
+    talker_weight_bytes += text_vocab * text_hidden * dtype_bytes  # text embedding
+    talker_weight_bytes += text_hidden * talker_cfg.hidden_size * dtype_bytes  # text projection
+
+    # ── Overhead factor for CUDA graphs, activations, fragmentation ──
+    overhead_factor = 1.5
+
+    talker_fixed = int(talker_weight_bytes * overhead_factor)
+    pred_fixed = int(pred_weight_bytes * overhead_factor)
+
+    # ── KV block sizes ──
+    kv_block_talker = _kv_block_bytes(talker_cfg, kvcache_block_size, dtype_bytes)
+    kv_block_pred = _kv_block_bytes(pred_cfg, kvcache_block_size, dtype_bytes)
+
+    # ── Budget ──
+    # process_gpu_memory_fraction = gpu_memory_utilization
+    # → effective_total = total * gpu_memory_utilization (this process's VRAM cap)
+    # → allocate_kv_cache uses torch.cuda.memory_allocated() (per-process only)
+    # This is what makes multiple independent servers on the same GPU work.
+    total_vram = torch.cuda.get_device_properties(0).total_memory
+    process_fraction = gpu_memory_utilization
+    effective_total = total_vram * process_fraction
+
+    # ── KV cache budget (what's left after models within this process's share) ──
+    kv_budget = effective_total - talker_fixed - pred_fixed
+    if kv_budget <= 0:
+        logger.warning(
+            f"[memory_split] Model weights ({(talker_fixed + pred_fixed) / 1e9:.2f} GB) "
+            f"exceed budget ({effective_total / 1e9:.2f} GB). Using minimum KV cache."
+        )
+        talker_util = max(0.05, (talker_fixed + kv_block_talker) / effective_total)
+        return {
+            "talker_util": talker_util,
+            "pred_util": 1.0,
+            "process_gpu_memory_fraction": process_fraction,
+        }
+
+    # ── Equal blocks: N = kv_budget / (block_talker + block_pred) ──
+    n_blocks = kv_budget / (kv_block_talker + kv_block_pred)
+    talker_kv_bytes = n_blocks * kv_block_talker
+
+    # ── Talker's share as fraction of effective_total ──
+    # KV formula: effective_total * talker_util - talker_model_stuff
+    # → talker_util = (talker_model_stuff + talker_kv) / effective_total
+    talker_util = (talker_fixed + talker_kv_bytes) / effective_total
+    talker_util = max(0.05, min(talker_util, 0.95))
+
+    # Predictor uses util=1.0 → claims up to effective_total minus everything already used
+    pred_util = 1.0
+
+    logger.info(
+        f"[memory_split] GPU total={total_vram / 1e9:.1f} GB, "
+        f"process_fraction={process_fraction:.2f} "
+        f"({effective_total / 1e9:.1f} GB for this instance)\n"
+        f"  Talker: weights~{talker_weight_bytes / 1e6:.0f} MB, "
+        f"kv_block={kv_block_talker / 1024:.0f} KB, "
+        f"util={talker_util:.3f}\n"
+        f"  Predictor: weights~{pred_weight_bytes / 1e6:.0f} MB, "
+        f"kv_block={kv_block_pred / 1024:.0f} KB, "
+        f"util={pred_util:.3f} (claims rest)\n"
+        f"  KV budget: {kv_budget / 1e6:.0f} MB → "
+        f"{int(n_blocks)} blocks each "
+        f"(talker {int(n_blocks) * kv_block_talker / 1e6:.0f} MB + "
+        f"pred {int(n_blocks) * kv_block_pred / 1e6:.0f} MB)"
+    )
+
+    return {
+        "talker_util": talker_util,
+        "pred_util": pred_util,
+        "process_gpu_memory_fraction": process_fraction,
+    }
 
 
 try:
@@ -65,6 +210,7 @@ class Qwen3TTSInterface:
         revision: Optional[str] = None,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
         zmq_bridge=None,
     ):
         """Load Qwen3TTSInterface from HuggingFace model repository or local path.
@@ -83,6 +229,8 @@ class Qwen3TTSInterface:
             revision: Git revision/branch/tag to download. Defaults to "main".
             enforce_eager: Whether to enforce eager mode (disable CUDA graphs).
             tensor_parallel_size: Number of GPUs for tensor parallelism.
+            gpu_memory_utilization: Fraction of GPU memory to use for the entire interface
+                (both Talker and Predictor models). Automatically split between models.
             zmq_bridge: Optional ZMQ bridge for async generation.
         
         Returns:
@@ -161,19 +309,47 @@ class Qwen3TTSInterface:
             model_path=model_path,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
             zmq_bridge=zmq_bridge,
         )
     
-    def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1, zmq_bridge=None):
+    def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1,
+                 gpu_memory_utilization: float = 0.9, zmq_bridge=None):
         self.model_path = model_path
         self.enforce_eager = enforce_eager
         self.tensor_parallel_size = tensor_parallel_size
         self.zmq_bridge = zmq_bridge
 
+        # ── Smart memory split: one gpu_memory_utilization → per-model settings ──
+        # Reads model config to estimate weight sizes and KV cache needs,
+        # then calculates how to split the VRAM budget between Talker and Predictor
+        # so both get a fair share of KV cache blocks within the user's budget.
+        #
+        # Always sets process_gpu_memory_fraction so each process uses per-process
+        # memory accounting (torch.cuda.memory_allocated). This means you can run
+        # multiple independent servers on the same GPU:
+        #   Server 1: GPU_MEMORY_UTILIZATION=0.3 python server.py --port 8000
+        #   Server 2: GPU_MEMORY_UTILIZATION=0.3 python server.py --port 8001
+        # Each claims 30% of VRAM independently without interfering.
+        mem_cfg = _compute_memory_split(model_path, gpu_memory_utilization)
+        talker_util = mem_cfg["talker_util"]
+        pred_util = mem_cfg["pred_util"]
+        proc_frac = mem_cfg["process_gpu_memory_fraction"]
+
         # Both sync and ZMQ modes load engines in the same process.
         # ZMQ mode uses asyncio engine-loop tasks (see start_zmq_tasks).
-        self.talker_llm = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.3)
-        self.predictor_llm = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size)
+        self.talker_llm = TalkerLLM(
+            model_path, enforce_eager=enforce_eager,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=talker_util,
+            process_gpu_memory_fraction=proc_frac,
+        )
+        self.predictor_llm = PredictorLLM(
+            model_path, enforce_eager=enforce_eager,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=pred_util,
+            process_gpu_memory_fraction=proc_frac,
+        )
         self.processor = _get_processor(model_path)
         self.model_config = self.talker_llm.model_runner.full_config
 

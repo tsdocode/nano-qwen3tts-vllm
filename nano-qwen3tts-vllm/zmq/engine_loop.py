@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Safety timeout to prevent infinite wait if a client disconnects.
 # Normal wait is <20ms (one predictor burst cycle). This is just a safety net.
-TALKER_BATCH_WAIT_SAFETY_MS = 200.0  # milliseconds
+TALKER_BATCH_WAIT_SAFETY_MS = 20.0  # milliseconds
 
 # Brief sleep before predictor burst to let interface tasks submit work.
 # With N CCUs, N interface tasks compete for the event loop after talker

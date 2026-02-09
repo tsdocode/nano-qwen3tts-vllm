@@ -36,9 +36,17 @@ class ModelRunner:
         self.event = event
 
         if not dist.is_initialized():
+            # If world_size==1, pick a free port automatically so multiple
+            # independent server processes don't clash on the default port.
+            port = self.config.distributed_port
+            if self.world_size == 1:
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", 0))
+                    port = s.getsockname()[1]
             dist.init_process_group(
                 "nccl",
-                f"tcp://localhost:{self.config.distributed_port}",
+                f"tcp://localhost:{port}",
                 world_size=self.world_size,
                 rank=rank,
             )

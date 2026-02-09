@@ -407,6 +407,12 @@ def main():
         help="Server port (default: 7860)",
     )
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.2,
+        help="Fraction of GPU memory to use (default: 0.9). Automatically split between Talker and Predictor.",
+    )
+    parser.add_argument(
         "--share",
         action="store_true",
         help="Create a public Gradio share link",
@@ -416,10 +422,13 @@ def main():
     
     global interface
     
+    gpu_mem_util = float(os.environ.get("GPU_MEMORY_UTILIZATION", str(args.gpu_memory_utilization)))
+    
     print("=" * 60)
     print("Loading Neto's Base Model for Voice Cloning")
     print("=" * 60)
     print(f"Model path: {args.model_path}")
+    print(f"GPU memory utilization: {gpu_mem_util}")
     
     # Initialize Base model for voice cloning
     if os.path.isdir(args.model_path) or os.path.isfile(args.model_path):
@@ -428,6 +437,7 @@ def main():
             model_path=args.model_path,
             enforce_eager=False,
             tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_mem_util,
         )
     else:
         # Likely a HuggingFace model ID, use from_pretrained
@@ -436,6 +446,7 @@ def main():
             pretrained_model_name_or_path=args.model_path,
             enforce_eager=False,
             tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_mem_util,
         )
     
     print("✓ Model loaded successfully")

@@ -66,7 +66,8 @@ def get_interface():
     if _interface is None:
         from nano_qwen3tts_vllm.interface import Qwen3TTSInterface
         model_path = os.environ.get("QWEN3_TTS_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-        
+        gpu_mem_util = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.9"))
+
         # Check if it's a local path or HuggingFace model ID
         if os.path.isdir(model_path) or os.path.isfile(model_path):
             # Local path - use regular init
@@ -84,9 +85,10 @@ def get_interface():
                     model_path=model_path,
                     zmq_bridge=_zmq_bridge,
                     enforce_eager=False,
+                    gpu_memory_utilization=gpu_mem_util,
                 )
             else:
-                _interface = Qwen3TTSInterface(model_path=model_path)
+                _interface = Qwen3TTSInterface(model_path=model_path, gpu_memory_utilization=gpu_mem_util)
         else:
             # HuggingFace model ID - use from_pretrained
             if _use_zmq():
@@ -103,11 +105,13 @@ def get_interface():
                     pretrained_model_name_or_path=model_path,
                     zmq_bridge=_zmq_bridge,
                     enforce_eager=False,
+                    gpu_memory_utilization=gpu_mem_util,
                 )
             else:
                 _interface = Qwen3TTSInterface.from_pretrained(
                     pretrained_model_name_or_path=model_path,
                     enforce_eager=False,
+                    gpu_memory_utilization=gpu_mem_util,
                 )
     return _interface
 
@@ -352,7 +356,15 @@ async def generate_speech_stream(request: SpeechRequest):
     ~130ms scheduling delay (consumer competes with talker/predictor for event
     loop time). By awaiting the first code directly via __anext__() and decoding
     inline, we eliminate that delay entirely.
+
+    CANCELLATION SAFETY: when the client disconnects mid-stream, we must:
+      1. Cancel the producer task (stops consuming from gen immediately)
+      2. Close gen (triggers interface.py's finally → clear_request)
+    Without this, a ghost sequence stays in scheduler.running and causes
+    200ms batch_wait timeouts on every subsequent talker step.
     """
+    gen = None
+    producer_task = None
     try:
         interface = get_interface()
         tokenizer = get_tokenizer()
@@ -360,16 +372,17 @@ async def generate_speech_stream(request: SpeechRequest):
         start_time = time.time()
 
         # --- Create the async generator (voice clone or custom voice) ---
+        text = "..." + request.text
         if is_voice_clone(request.speaker):
             voice_clone_prompt = load_voice_clone_prompt(request.speaker)
             gen = interface.generate_voice_clone_async(
-                text=request.text,
+                text=text,
                 language=request.language,
                 voice_clone_prompt=voice_clone_prompt,
             )
         else:
             gen = interface.generate_custom_voice_async(
-                text=request.text,
+                text=text,
                 language=request.language,
                 speaker=request.speaker,
             )
@@ -439,7 +452,14 @@ async def generate_speech_stream(request: SpeechRequest):
                 if chunk:
                     yield chunk
         finally:
-            await producer_task
+            # Cancel producer immediately -- don't wait for it to finish naturally.
+            # Without cancel(), a disconnected client leaves the producer running
+            # for seconds, keeping the ghost sequence in scheduler.running.
+            producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):
+                pass
     except StopAsyncIteration:
         # Generator produced no codes at all
         pass
@@ -448,6 +468,15 @@ async def generate_speech_stream(request: SpeechRequest):
         import traceback
         traceback.print_exc()
         raise e
+    finally:
+        # ALWAYS close the interface generator to trigger its cleanup
+        # (clear_request in interface.py's finally block removes the sequence
+        # from scheduler.running, preventing ghost sequence / batch_wait timeouts).
+        if gen is not None:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass  # may already be closed from normal EOS
 
 @app.post("/v1/audio/speech", response_class=StreamingResponse)
 async def generate_speech(request: SpeechRequest):
