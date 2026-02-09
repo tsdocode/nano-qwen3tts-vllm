@@ -125,6 +125,38 @@ class SpeechTokenizerCUDAGraph:
             (wavs, sample_rate).
         """
         return self.tokenizer.decode(inputs)
+    
+    @torch.inference_mode()
+    def chunked_decode(
+        self, inputs: List[dict], chunk_size: int = 300, left_context_size: int = 25,
+    ) -> Tuple[List, int]:
+        """Decode audio_codes using overlap-add chunking to avoid boundary artifacts.
+
+        Args:
+            inputs: List of dicts with key 'audio_codes' (tensor [time, 16] or list).
+            chunk_size: Number of codec frames per chunk (default: 300).
+            left_context_size: Overlap frames for crossfade between chunks (default: 25).
+
+        Returns:
+            (wavs, sample_rate).
+        """
+        audio_codes = inputs[0]["audio_codes"]
+
+        # Convert to [1, 16, time] tensor
+        if isinstance(audio_codes, list):
+            codes = torch.tensor(audio_codes, dtype=torch.long, device=self.device)
+        else:
+            codes = audio_codes.to(self.device)
+        if codes.dim() == 2:  # [time, 16] -> [1, 16, time]
+            codes = codes.transpose(0, 1).unsqueeze(0)
+
+        # Chunked decode via decoder (each chunk hits CUDAGraph-patched forward)
+        decoder_model = self.tokenizer.model.decoder
+        wav = decoder_model.chunked_decode(codes, chunk_size, left_context_size)
+
+        wavs = [wav.squeeze().to(torch.float32).cpu().numpy()]
+        sr = int(self.tokenizer.model.get_output_sample_rate())
+        return wavs, sr
 
     @torch.inference_mode()
     def decode_codec_ids(self, codec_ids: torch.Tensor) -> Tuple[List, int]:

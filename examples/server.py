@@ -312,7 +312,7 @@ def _decode_inline(audio_codes: list) -> tuple[np.ndarray, int]:
     """
     tokenizer = get_tokenizer()
     with torch.inference_mode():
-        wav_list, sr = tokenizer.decode([{"audio_codes": audio_codes}])
+        wav_list, sr = tokenizer.chunked_decode([{"audio_codes": audio_codes}])
     wav_24k = _resample_to_24k(wav_list[0], sr)
     return _float_to_pcm16(wav_24k), TARGET_SAMPLE_RATE
 
@@ -374,14 +374,24 @@ async def generate_speech_stream(request: SpeechRequest):
                 speaker=request.speaker,
             )
 
-        # --- FIRST CHUNK: get directly, decode inline, yield immediately ---
-        # No queue, no task scheduling -- code → decode → HTTP in one coroutine.
-        first_code = await gen.__anext__()
+        # --- FIRST CHUNK: collect 2 codes, decode inline, yield immediately ---
+        # Waiting for 2 codes gives a longer initial audio segment for smoother
+        # playback start, at the cost of one extra decode cycle (~50ms).
+        FIRST_CHUNK_CODES = 2
+        first_codes = []
+        async for audio_code in gen:
+            first_codes.append(audio_code)
+            if len(first_codes) >= FIRST_CHUNK_CODES:
+                break
+        if not first_codes:
+            return  # generator produced nothing
+
         t_first_code = time.time()
-        pcm16_first, _ = _decode_inline([first_code])
+        pcm16_first, _ = _decode_inline(first_codes)
         t_first_decoded = time.time()
         logger.info(
-            f"[stream] first code latency: {(t_first_code - start_time)*1000:.1f}ms "
+            f"[stream] first chunk codes={len(first_codes)} "
+            f"latency: {(t_first_code - start_time)*1000:.1f}ms "
             f"decode: {(t_first_decoded - t_first_code)*1000:.1f}ms "
             f"total: {(t_first_decoded - start_time)*1000:.1f}ms"
         )
@@ -392,7 +402,7 @@ async def generate_speech_stream(request: SpeechRequest):
         codes_queue: asyncio.Queue[list | None] = asyncio.Queue()  # unbounded
 
         async def producer() -> None:
-            audio_codes = [first_code]  # first code already yielded
+            audio_codes = list(first_codes)  # first codes already yielded
             last_chunk_time = t_first_code
             try:
                 async for audio_code in gen:
