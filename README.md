@@ -19,6 +19,54 @@ Optimization for the Qwen3-TTS model will continue in the [vllm-omni](https://gi
 - **CUDA Graph** — Predictor and speech decoder use captured CUDA graphs (multiple batch sizes / decode lengths) to reduce kernel launch overhead.
 - **Streaming Support** — Async generation with ZMQ: stream codec chunks as they are produced; API returns PCM audio stream (e.g. `POST /v1/audio/speech` with `StreamingResponse`).
 
+## Architecture (multiprocess + ZMQ)
+
+When using multiprocess engines (`USE_MULTIPROCESS_ENGINES=1` or the default server setup), the main process runs the API and orchestration; the talker and predictor models run in separate worker processes. Communication is over **ZeroMQ (ZMQ)** TCP sockets: main **PUSH**es commands and **PULL**s results; a **result-bridge thread** turns worker replies into asyncio Future completions so engine loops can dispatch to per-request queues.
+
+```mermaid
+flowchart TB
+    subgraph Main["Main process"]
+        API[FastAPI / StreamingResponse]
+        IF[Interface & request_queues]
+        TL[talker_loop_mp]
+        PL[predictor_loop_mp]
+        TC[TalkerWorkerClient\nPUSH commands]
+        PC[PredictorWorkerClient\nPUSH commands]
+        Bridge[Result bridge thread\nPULL results → Futures]
+        API --> IF
+        IF --> TL
+        IF --> PL
+        TL --> TC
+        TL --> Bridge
+        PL --> PC
+        PL --> Bridge
+        Bridge --> TL
+        Bridge --> PL
+    end
+
+    subgraph Talker["Talker worker process"]
+        TPULL[PULL\ncommands]
+        TLLM[TalkerLLM]
+        TPUSH[PUSH\nresults]
+        TPULL --> TLLM --> TPUSH
+    end
+
+    subgraph Predictor["Predictor worker process"]
+        PPULL[PULL\ncommands]
+        PLLM[PredictorLLM]
+        PPUSH[PUSH\nresults]
+        PPULL --> PLLM --> PPUSH
+    end
+
+    TC -->|"add_request, run_step,\nclear_request (pickle)"| TPULL
+    TPUSH -->|"step_id, outputs_all\n(pickle)"| Bridge
+    PC -->|"commands (pickle)"| PPULL
+    PPUSH -->|"results (pickle)"| Bridge
+```
+
+- **Commands** (main → workers): serialized with `workers/protocol.py` (pickle + numpy); e.g. `add_request`, `run_step`, `clear_request`, `shutdown`.
+- **Results** (workers → main): worker PUSHes to main’s PULL sockets; the result-bridge thread completes the corresponding asyncio Future; engine loops then push `(engine_type, msg_type, payload)` into `request_queues[request_id]` for the API to consume.
+
 ## Benchmark Results
 
 ### Performance Comparison (Voice Design Model)
