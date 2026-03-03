@@ -3,8 +3,8 @@ import base64
 import io
 import os
 import queue
-import threading
 import uuid
+import torch
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -20,8 +20,182 @@ from librosa.filters import mel as librosa_mel_fn
 from nano_qwen3tts_vllm.utils.prompt import prepare_custom_voice_prompt, _ensure_list, _tokenize_texts
 from nano_qwen3tts_vllm.processor import Qwen3TTSProcessor
 from nano_qwen3tts_vllm.utils.generation import prepare_inputs, generate_speaker_prompt, generate_icl_prompt
-from nano_qwen3tts_vllm.llm import TalkerLLM, PredictorLLM
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
+from nano_qwen3tts_vllm.utils.embedding_loader import load_embeddings_only
+from nano_qwen3tts_vllm.config import Qwen3TTSConfig
+import copy
+import gc
+import json
+import logging
+
+import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+
+def _clone_embedding_module(module: nn.Module, device: torch.device) -> nn.Module:
+    """Clone an nn.Module so the original can be freed. Returns new module on device."""
+    if isinstance(module, nn.ModuleList):
+        return nn.ModuleList([_clone_embedding_module(m, device) for m in module])
+    state = {k: v.cpu().clone() for k, v in module.state_dict().items()}
+    if isinstance(module, nn.Embedding):
+        out = nn.Embedding(
+            module.num_embeddings,
+            module.embedding_dim,
+            padding_idx=getattr(module, "padding_idx", None),
+        )
+        out.load_state_dict(state, strict=True)
+        return out.to(device)
+    if isinstance(module, nn.Linear):
+        out = nn.Linear(module.in_features, module.out_features, bias=module.bias is not None)
+        out.load_state_dict(state, strict=True)
+        return out.to(device)
+    # Custom (e.g. Qwen3TTSTalkerResizeMLP): deepcopy then to device
+    return copy.deepcopy(module).to(device)
+
+
+def _estimate_model_params(cfg) -> int:
+    """Estimate total parameter count from a model config (Talker or Predictor)."""
+    h = cfg.hidden_size
+    i = cfg.intermediate_size
+    n_layers = cfg.num_hidden_layers
+    n_heads = cfg.num_attention_heads
+    n_kv = cfg.num_key_value_heads
+    head_dim = getattr(cfg, 'head_dim', None) or (h // n_heads)
+
+    # Per layer: Q + K + V + O projections + MLP (gate, up, down) + 2 norms
+    qkvo = h * (n_heads * head_dim) + h * (n_kv * head_dim) * 2 + (n_heads * head_dim) * h
+    mlp = h * i * 3  # gate_proj + up_proj + down_proj
+    norms = h * 2  # 2 RMSNorm per layer
+    per_layer = qkvo + mlp + norms
+
+    # Embeddings
+    vocab = getattr(cfg, 'vocab_size', 0) * h
+    # LM head (often tied, but count conservatively)
+    lm_head = h * getattr(cfg, 'vocab_size', 0)
+
+    return n_layers * per_layer + vocab + lm_head
+
+
+def _kv_block_bytes(cfg, block_size: int = 256, dtype_bytes: int = 2) -> int:
+    """KV cache memory per block for a model: 2 (K+V) * layers * block * kv_heads * head_dim * dtype."""
+    n_kv = cfg.num_key_value_heads
+    head_dim = getattr(cfg, 'head_dim', None) or (cfg.hidden_size // cfg.num_attention_heads)
+    return 2 * cfg.num_hidden_layers * block_size * n_kv * head_dim * dtype_bytes
+
+
+def _compute_memory_split(
+    model_path: str,
+    gpu_memory_utilization: float,
+    kvcache_block_size: int = 256,
+) -> dict:
+    """Compute per-model memory settings so both fit within the user's target.
+
+    The user passes ONE number (e.g. 0.9 or 0.3) and this function figures out
+    how to split VRAM between Talker and Predictor.
+
+    Always uses process_gpu_memory_fraction so that each server process only
+    sees its OWN memory via torch.cuda.memory_allocated(), not the whole GPU.
+    This means you can start multiple independent servers on the same GPU
+    (e.g. 2 servers with gpu_memory_utilization=0.3 each) and they just work.
+
+    Strategy:
+      1. Set process_gpu_memory_fraction = gpu_memory_utilization.
+         This gives this process an "effective_total" = total * fraction.
+         The KV cache formula then uses per-process memory accounting.
+      2. Within that budget, calculate talker_util (fraction of effective_total
+         the talker should claim). Predictor gets the rest (pred_util=1.0).
+      3. Both models get an equal number of KV cache blocks.
+
+    Returns:
+        dict with: talker_util, pred_util, process_gpu_memory_fraction
+    """
+    with open(os.path.join(model_path, "config.json"), "r") as f:
+        raw_cfg = json.load(f)
+    full_cfg = Qwen3TTSConfig(**raw_cfg)
+    talker_cfg = full_cfg.talker_config
+    pred_cfg = full_cfg.talker_config.code_predictor_config
+
+    dtype_bytes = 2  # bf16
+
+    # ── Estimate model weight bytes ──
+    talker_weight_bytes = _estimate_model_params(talker_cfg) * dtype_bytes
+    pred_weight_bytes = _estimate_model_params(pred_cfg) * dtype_bytes
+
+    # Talker has extra embeddings: text_embedding (text_vocab * text_hidden) + text_projection
+    text_vocab = getattr(talker_cfg, 'text_vocab_size', 151936)
+    text_hidden = getattr(talker_cfg, 'text_hidden_size', 2048)
+    talker_weight_bytes += text_vocab * text_hidden * dtype_bytes  # text embedding
+    talker_weight_bytes += text_hidden * talker_cfg.hidden_size * dtype_bytes  # text projection
+
+    # ── Overhead factor for CUDA graphs, activations, fragmentation ──
+    overhead_factor = 1.5
+
+    talker_fixed = int(talker_weight_bytes * overhead_factor)
+    pred_fixed = int(pred_weight_bytes * overhead_factor)
+
+    # ── KV block sizes ──
+    kv_block_talker = _kv_block_bytes(talker_cfg, kvcache_block_size, dtype_bytes)
+    kv_block_pred = _kv_block_bytes(pred_cfg, kvcache_block_size, dtype_bytes)
+
+    # ── Budget ──
+    # process_gpu_memory_fraction = gpu_memory_utilization
+    # → effective_total = total * gpu_memory_utilization (this process's VRAM cap)
+    # → allocate_kv_cache uses torch.cuda.memory_allocated() (per-process only)
+    # This is what makes multiple independent servers on the same GPU work.
+    total_vram = torch.cuda.get_device_properties(0).total_memory
+    process_fraction = gpu_memory_utilization
+    effective_total = total_vram * process_fraction
+
+    # ── KV cache budget (what's left after models within this process's share) ──
+    kv_budget = effective_total - talker_fixed - pred_fixed
+    if kv_budget <= 0:
+        logger.warning(
+            f"[memory_split] Model weights ({(talker_fixed + pred_fixed) / 1e9:.2f} GB) "
+            f"exceed budget ({effective_total / 1e9:.2f} GB). Using minimum KV cache."
+        )
+        talker_util = max(0.05, (talker_fixed + kv_block_talker) / effective_total)
+        return {
+            "talker_util": talker_util,
+            "pred_util": 1.0,
+            "process_gpu_memory_fraction": process_fraction,
+        }
+
+    # ── Equal blocks: N = kv_budget / (block_talker + block_pred) ──
+    n_blocks = kv_budget / (kv_block_talker + kv_block_pred)
+    talker_kv_bytes = n_blocks * kv_block_talker
+
+    # ── Talker's share as fraction of effective_total ──
+    # KV formula: effective_total * talker_util - talker_model_stuff
+    # → talker_util = (talker_model_stuff + talker_kv) / effective_total
+    talker_util = (talker_fixed + talker_kv_bytes) / effective_total
+    talker_util = max(0.05, min(talker_util, 0.95))
+
+    # Predictor uses util=1.0 → claims up to effective_total minus everything already used
+    pred_util = 1.0
+
+    logger.info(
+        f"[memory_split] GPU total={total_vram / 1e9:.1f} GB, "
+        f"process_fraction={process_fraction:.2f} "
+        f"({effective_total / 1e9:.1f} GB for this instance)\n"
+        f"  Talker: weights~{talker_weight_bytes / 1e6:.0f} MB, "
+        f"kv_block={kv_block_talker / 1024:.0f} KB, "
+        f"util={talker_util:.3f}\n"
+        f"  Predictor: weights~{pred_weight_bytes / 1e6:.0f} MB, "
+        f"kv_block={kv_block_pred / 1024:.0f} KB, "
+        f"util={pred_util:.3f} (claims rest)\n"
+        f"  KV budget: {kv_budget / 1e6:.0f} MB → "
+        f"{int(n_blocks)} blocks each "
+        f"(talker {int(n_blocks) * kv_block_talker / 1e6:.0f} MB + "
+        f"pred {int(n_blocks) * kv_block_pred / 1e6:.0f} MB)"
+    )
+
+    return {
+        "talker_util": talker_util,
+        "pred_util": pred_util,
+        "process_gpu_memory_fraction": process_fraction,
+    }
+
 
 try:
     from huggingface_hub import snapshot_download
@@ -61,7 +235,7 @@ class Qwen3TTSInterface:
         revision: Optional[str] = None,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
-        zmq_bridge=None,
+        gpu_memory_utilization: float = 0.9,
     ):
         """Load Qwen3TTSInterface from HuggingFace model repository or local path.
         
@@ -79,7 +253,8 @@ class Qwen3TTSInterface:
             revision: Git revision/branch/tag to download. Defaults to "main".
             enforce_eager: Whether to enforce eager mode (disable CUDA graphs).
             tensor_parallel_size: Number of GPUs for tensor parallelism.
-            zmq_bridge: Optional ZMQ bridge for async generation.
+            gpu_memory_utilization: Fraction of GPU memory to use for the entire interface
+                (both Talker and Predictor models). Automatically split between models.
         
         Returns:
             Qwen3TTSInterface instance.
@@ -157,40 +332,69 @@ class Qwen3TTSInterface:
             model_path=model_path,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
-            zmq_bridge=zmq_bridge,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
     
-    def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1, zmq_bridge=None):
+    def __init__(self, model_path: str, enforce_eager: bool = False, tensor_parallel_size: int = 1,
+                 gpu_memory_utilization: float = 0.9):
         self.model_path = model_path
         self.enforce_eager = enforce_eager
         self.tensor_parallel_size = tensor_parallel_size
-        self.zmq_bridge = zmq_bridge
-        self.talker_llm = TalkerLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size, gpu_memory_utilization=0.3)
-        self.predictor_llm = PredictorLLM(model_path, enforce_eager=enforce_eager, tensor_parallel_size=tensor_parallel_size)
-        self.processor = _get_processor(model_path)
-        self.model_config = self.talker_llm.model_runner.full_config
-        
-        self.text_embedding = self.talker_llm.model_runner.model.get_text_embeddings()
-        self.input_embedding = self.talker_llm.model_runner.model.get_input_embeddings()
-        self.text_projection = self.talker_llm.model_runner.model.text_projection
-        
-        self.predictor_input_embeddings = self.predictor_llm.model_runner.model.model.codec_embedding
-        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
+        # Multiprocess only: main process loads embeddings; talker/predictor run in worker processes.
+        self._use_mp_engines = True
+
+        # ── Smart memory split ──
+        mem_cfg = _compute_memory_split(model_path, gpu_memory_utilization)
+        proc_frac = mem_cfg["process_gpu_memory_fraction"]
+
+        # Cap this process's GPU memory before any model load.
+        if torch.cuda.is_available():
+            try:
+                set_frac = getattr(torch.cuda, "set_per_process_memory_fraction", None) or getattr(
+                    getattr(torch.cuda, "memory", None), "set_per_process_memory_fraction", None
+                )
+                if set_frac is not None:
+                    set_frac(proc_frac, 0)
+                    logger.info(f"[memory] set_per_process_memory_fraction({proc_frac}) on device 0")
+            except Exception as e:
+                logger.warning(f"[memory] set_per_process_memory_fraction failed: {e}")
+
+        # Main process only needs config + embedding layers; workers hold full Talker/Predictor.
+        logger.info("[interface] multiprocess mode: loading only embeddings from disk (no runner init)")
+        (
+            self.model_config,
+            self.text_embedding,
+            self.input_embedding,
+            self.text_projection,
+            self.predictor_input_embeddings,
+        ) = load_embeddings_only(model_path, device=str(self.device))
+        self.talker_llm = None
+        self.predictor_llm = None
+
+        self.processor = _get_processor(model_path)
+        self._gpu_memory_utilization = gpu_memory_utilization
+        self._enforce_eager = enforce_eager
+        self._tensor_parallel_size = tensor_parallel_size
+
         # Initialize speech tokenizer and speaker encoder if available
         self.speech_tokenizer = None
         self.speaker_encoder = None
         self._init_speech_components()
+        self._mp_holder = None
 
-        # ZMQ path: asyncio queues; dispatcher and engine run as asyncio tasks (no threads).
+        # Asyncio queues for receiving outputs from multiprocess worker result bridge
         self._request_queues: dict[str, asyncio.Queue] = {}
         self._queues_lock = asyncio.Lock()
         self._zmq_tasks: list[asyncio.Task] = []
         self._zmq_inbox: queue.Queue | None = None
         self._zmq_tasks_started = False
-        # Serialize request prep (GPU work) so event loop can run engine while another request prepares.
-        self._prep_lock = threading.Lock()
+        # Allow concurrent request prep.  _do_prep runs in a thread-pool executor;
+        # CUDA default-stream serializes GPU ops automatically, so no GPU safety
+        # issue.  High concurrency lets 8+ CCU requests prepare in parallel,
+        # reducing the stagger that delays later prefills.
+        self._prep_sem = asyncio.Semaphore(8)
 
     def shutdown(self):
         """Explicitly release GPU resources (models, KV cache, CUDA graphs).
@@ -546,8 +750,10 @@ class Qwen3TTSInterface:
             chunks = list(interface.generate_voice_clone(text="Hello", voice_clone_prompt=prompt))
             wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
         """
-        if self.zmq_bridge is not None:
-            raise RuntimeError("generate_voice_clone does not support ZMQ bridge. Use sync mode.")
+        raise RuntimeError(
+            "Use async API: await interface.start_zmq_tasks(); "
+            "async for chunk in interface.generate_voice_clone_async(...)"
+        )
         
         if language is None:
             language = "Auto"
@@ -634,7 +840,6 @@ class Qwen3TTSInterface:
             generate_speaker_prompt_fn=generate_speaker_prompt_fn,
             generate_icl_prompt_fn=generate_icl_prompt_fn,
         )
-        
         # Generate and yield codebook_id chunks
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
@@ -642,6 +847,168 @@ class Qwen3TTSInterface:
             SamplingParams(temperature=1.0, max_tokens=1),
             SamplingParams(temperature=0.9, max_tokens=17),
         )
+    
+    async def generate_voice_clone_async(
+        self,
+        text: str,
+        language: str = None,
+        ref_audio: Optional[Any] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
+        voice_clone_prompt: Optional[Dict[str, Any]] = None,
+        non_streaming_mode: bool = True,
+    ):
+        """Async generator of codebook_id chunks for voice clone. Call await start_zmq_tasks() first.
+
+        This is an async generator that yields codebook_id chunks. Use SpeechTokenizer to decode.
+        
+        Args:
+            text: Text to synthesize (single string only, no batch support).
+            language: Language for the sample (default: "Auto").
+            ref_audio: Reference audio for prompt building. Required if voice_clone_prompt is not provided.
+            ref_text: Reference transcript used for ICL mode (required when x_vector_only_mode=False).
+            x_vector_only_mode: If True, only speaker embedding is used (ignores ref_text/ref_code).
+            voice_clone_prompt: Pre-built voice clone prompt dict from create_voice_clone_prompt.
+            non_streaming_mode: Using non-streaming text input.
+        
+        Yields:
+            Codebook ID chunks (List[int]). Use SpeechTokenizer.decode() to convert to audio.
+            
+        Example:
+            await interface.start_zmq_tasks()
+            chunks = []
+            async for chunk in interface.generate_voice_clone_async(text="Hello", voice_clone_prompt=prompt):
+                chunks.append(chunk)
+            wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
+        """
+        if not (self._use_mp_engines and self._mp_holder is not None):
+            raise RuntimeError("generate_voice_clone_async requires start_zmq_tasks() to be called first")
+        if language is None:
+            language = "Auto"
+        
+        def _do_prep() -> tuple:
+            """CPU/GPU prep work (run inside executor)."""
+            import time as _time
+            _t0 = _time.perf_counter()
+
+            # Build or use voice_clone_prompt
+            # Capture outer scope variables to avoid UnboundLocalError
+            vc_prompt = voice_clone_prompt
+            if vc_prompt is None:
+                if ref_audio is None:
+                    raise ValueError("Either `voice_clone_prompt` or `ref_audio` must be provided.")
+                vc_prompt = self.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    x_vector_only_mode=x_vector_only_mode
+                )
+                ref_text_for_ids = ref_text
+            else:
+                # When voice_clone_prompt is provided, check if ICL mode is enabled
+                # If so, use ref_text from prompt or provided ref_text parameter
+                icl_mode_enabled = vc_prompt.get("icl_mode", False)
+                if icl_mode_enabled:
+                    # Prefer ref_text from parameter, fallback to stored ref_text in prompt
+                    prompt_ref_text = vc_prompt.get("ref_text")
+                    if ref_text is not None:
+                        ref_text_for_ids = ref_text
+                    elif prompt_ref_text is not None:
+                        ref_text_for_ids = prompt_ref_text
+                    else:
+                        raise ValueError(
+                            "ICL mode is enabled in voice_clone_prompt but ref_text is not available. "
+                            "Please provide ref_text when creating voice_clone_prompt or when calling generate_voice_clone_async."
+                        )
+                else:
+                    ref_text_for_ids = None
+            
+            _t1 = _time.perf_counter()
+
+            # Tokenize text
+            input_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+            input_ids = _tokenize_texts([input_text], self.processor, self.device)
+            
+            _t2 = _time.perf_counter()
+
+            # Tokenize ref_text if provided (for ICL mode)
+            ref_ids = None
+            if ref_text_for_ids is not None and ref_text_for_ids != "":
+                ref_tok = _tokenize_texts([self._build_ref_text(ref_text_for_ids)], self.processor, self.device)[0]
+                ref_ids = [ref_tok]
+            
+            _t3 = _time.perf_counter()
+
+            # Prepare voice_clone_prompt as lists (for compatibility with prepare_inputs which expects batch format)
+            voice_clone_prompt_lists = {
+                "ref_code": [vc_prompt["ref_code"]],
+                "ref_spk_embedding": [vc_prompt["ref_spk_embedding"]],
+                "x_vector_only_mode": [vc_prompt["x_vector_only_mode"]],
+                "icl_mode": [vc_prompt["icl_mode"]],
+            }
+            
+            # Prepare generate_speaker_prompt_fn and generate_icl_prompt_fn
+            def generate_speaker_prompt_fn(prompt):
+                return generate_speaker_prompt(prompt, self.device)
+            
+            def generate_icl_prompt_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
+                return generate_icl_prompt(
+                    text_id=text_id,
+                    ref_id=ref_id,
+                    ref_code=ref_code,
+                    tts_pad_embed=tts_pad_embed,
+                    tts_eos_embed=tts_eos_embed,
+                    non_streaming_mode=non_streaming_mode,
+                    config=self.model_config,
+                    text_embedding=self.text_embedding,
+                    input_embedding=self.input_embedding,
+                    text_projection=self.text_projection,
+                    code_predictor_embeddings=self.predictor_input_embeddings,
+                    device=self.device,
+                )
+            
+            _t4 = _time.perf_counter()
+
+            # Prepare inputs
+            result = prepare_inputs(
+                config=self.model_config,
+                input_ids=input_ids,
+                ref_ids=ref_ids,
+                voice_clone_prompt=voice_clone_prompt_lists,
+                languages=[language],
+                non_streaming_mode=non_streaming_mode,
+                text_embedding=self.text_embedding,
+                input_embedding=self.input_embedding,
+                text_projection=self.text_projection,
+                device=self.device,
+                generate_speaker_prompt_fn=generate_speaker_prompt_fn,
+                generate_icl_prompt_fn=generate_icl_prompt_fn,
+            )
+
+            _t5 = _time.perf_counter()
+            logger.info(
+                f"[_do_prep] prompt={(_t1-_t0)*1000:.1f}ms "
+                f"tokenize_text={(_t2-_t1)*1000:.1f}ms "
+                f"tokenize_ref={(_t3-_t2)*1000:.1f}ms "
+                f"prepare_inputs={(_t5-_t4)*1000:.1f}ms "
+                f"total={(_t5-_t0)*1000:.1f}ms"
+            )
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = result
+            return result
+        
+        # Run prep directly on event loop – all ops are tiny GPU kernels on the
+        # default CUDA stream so they serialise anyway.  run_in_executor adds
+        # ~100ms+ of GIL/thread-scheduling overhead for no benefit.
+        t_prep_start = time.time()
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = _do_prep()
+        t_prep_end = time.time()
+        logger.info(
+            f"[voice_clone_async] _do_prep exec={(t_prep_end - t_prep_start)*1000:.1f}ms"
+        )
+        
+        async for chunk in self.generate_async(
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
+        ):
+            yield chunk
     
     def generate_voice_design(
         self,
@@ -674,8 +1041,6 @@ class Qwen3TTSInterface:
             ))
             wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": chunks}])
         """
-        if self.zmq_bridge is not None:
-            raise RuntimeError("generate_voice_design does not support ZMQ bridge. Use sync mode.")
         
         if language is None:
             language = "Auto"
@@ -714,45 +1079,51 @@ class Qwen3TTSInterface:
         )
     
     async def start_zmq_tasks(self) -> None:
-        """Start the ZMQ dispatcher (thread + asyncio task) and engine loop. Call once before generate_async when zmq_bridge is set."""
-        if self.zmq_bridge is None:
-            raise RuntimeError("start_zmq_tasks requires zmq_bridge to be set on the interface")
+        """Start multiprocess engines (talker + predictor workers) and asyncio orchestrator loops."""
         if self._zmq_tasks_started:
             return
         self._zmq_tasks_started = True
-        from nano_qwen3tts_vllm.zmq.dispatcher import start_dispatcher_thread, run_dispatch_loop
-        from nano_qwen3tts_vllm.zmq.engine_loop import run_engine_loop
-        # Dedicated thread for blocking ZMQ recv (so it is already waiting before first publish)
-        _, inbox = start_dispatcher_thread(self.zmq_bridge.bind_address)
-        self._zmq_inbox = inbox
-        t1 = asyncio.create_task(run_dispatch_loop(inbox, self._request_queues, self._queues_lock))
-        t2 = asyncio.create_task(run_engine_loop(
-            self.talker_llm, self.predictor_llm, self.zmq_bridge
+
+        from nano_qwen3tts_vllm.workers.client_bridge import start_multiprocess_engines
+        from nano_qwen3tts_vllm.zmq.engine_loop_mp import run_talker_loop_mp, run_predictor_loop_mp
+        holder = start_multiprocess_engines(
+            self.model_path,
+            self._request_queues,
+            self._queues_lock,
+            gpu_memory_utilization=self._gpu_memory_utilization,
+            enforce_eager=self._enforce_eager,
+            tensor_parallel_size=self._tensor_parallel_size,
+        )
+        self._mp_holder = holder
+        t1 = asyncio.create_task(run_talker_loop_mp(
+            holder.talker_client, self._request_queues, self._queues_lock, holder.talker_ready
+        ))
+        t2 = asyncio.create_task(run_predictor_loop_mp(
+            holder.predictor_client, self._request_queues, self._queues_lock, holder.predictor_ready
         ))
         self._zmq_tasks.extend([t1, t2])
-        # Give the recv thread time to connect and enter recv (avoid ZMQ slow-joiner)
         await asyncio.sleep(0.2)
 
     async def stop_zmq_tasks(self) -> None:
-        """Stop ZMQ tasks so the event loop can exit. Puts sentinel in inbox to unblock executor thread."""
+        """Stop multiprocess engines and orchestrator loops."""
         if not self._zmq_tasks:
             return
-        # Unblock the thread blocked on inbox.get() in run_in_executor so shutdown_default_executor() can finish
-        if self._zmq_inbox is not None:
-            self._zmq_inbox.put(None)
+
+        if self._mp_holder is not None:
+            await self._mp_holder.stop_async()
+            self._mp_holder = None
+
         for t in self._zmq_tasks:
             t.cancel()
         await asyncio.gather(*self._zmq_tasks, return_exceptions=True)
         self._zmq_tasks.clear()
-        self._zmq_inbox = None
 
     def generate_custom_voice(self, text: str, language: str = "English", speaker: str = "Vivian"):
-        """Sync generator. Only valid when zmq_bridge is None. For ZMQ use generate_custom_voice_async()."""
-        if self.zmq_bridge is not None:
-            raise RuntimeError(
-                "When using ZMQ bridge, use async API: await interface.start_zmq_tasks(); "
-                "async for chunk in interface.generate_custom_voice_async(...)"
-            )
+        """Sync generator. Not supported; use async API (start_zmq_tasks + generate_custom_voice_async)."""
+        raise RuntimeError(
+            "Use async API: await interface.start_zmq_tasks(); "
+            "async for chunk in interface.generate_custom_voice_async(...)"
+        )
         input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
             text=text, language=language, speaker=speaker,
             processor=self.processor, device=self.device,
@@ -774,38 +1145,34 @@ class Qwen3TTSInterface:
     async def generate_custom_voice_async(
         self, text: str, language: str = "English", speaker: str = "Vivian"
     ):
-        """Async generator of codebook_id chunks. Requires zmq_bridge; call await start_zmq_tasks() first."""
-        if self.zmq_bridge is None:
-            raise RuntimeError("generate_custom_voice_async requires zmq_bridge")
+        """Async generator of codebook_id chunks. Call await start_zmq_tasks() first."""
+        if not (self._use_mp_engines and self._mp_holder is not None):
+            raise RuntimeError("generate_custom_voice_async requires start_zmq_tasks() to be called first")
 
-        def _prep_in_thread() -> tuple:
-            """Run prep in executor so event loop can run engine_loop; lock serializes GPU prep."""
-            with self._prep_lock:
-                input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
-                    text=text, language=language, speaker=speaker,
-                    processor=self.processor, device=self.device,
-                )
-                return prepare_inputs(
-                    config=self.model_config,
-                    input_ids=input_ids, instruct_ids=instruct_ids, speakers=speakers, languages=languages,
-                    non_streaming_mode=True,
-                    text_embedding=self.text_embedding, input_embedding=self.input_embedding,
-                    text_projection=self.text_projection, device=self.device,
-                )
+        def _do_prep() -> tuple:
+            """CPU/GPU prep work (run inside executor)."""
+            input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
+                text=text, language=language, speaker=speaker,
+                processor=self.processor, device=self.device,
+            )
+            return prepare_inputs(
+                config=self.model_config,
+                input_ids=input_ids, instruct_ids=instruct_ids, speakers=speakers, languages=languages,
+                non_streaming_mode=True,
+                text_embedding=self.text_embedding, input_embedding=self.input_embedding,
+                text_projection=self.text_projection, device=self.device,
+            )
 
-        loop = asyncio.get_event_loop()
-        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = await loop.run_in_executor(
-            None, _prep_in_thread
-        )
+        # Run prep directly – tiny GPU kernels, no benefit from threading.
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = _do_prep()
         async for chunk in self.generate_async(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
         ):
             yield chunk
 
     def generate(self, inputs_embeds: torch.Tensor, trailing_text_hiddens: torch.Tensor, tts_pad_embed: torch.Tensor, talker_attention_mask: torch.Tensor, request_id: str | None = None):
-        """Sync generator. Only valid when zmq_bridge is None."""
-        if self.zmq_bridge is not None:
-            raise RuntimeError("When using ZMQ bridge use generate_async() after await start_zmq_tasks()")
+        """Sync generator. Not supported; use generate_async() after await start_zmq_tasks()."""
+        raise RuntimeError("Use generate_async() after await start_zmq_tasks()")
         request_id = request_id or str(uuid.uuid4())
         talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
         predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
@@ -822,9 +1189,9 @@ class Qwen3TTSInterface:
         talker_attention_mask: torch.Tensor,
         request_id: str | None = None,
     ):
-        """Async generator of codebook_id chunks. ZMQ path; step() runs on event loop thread. Call await start_zmq_tasks() first."""
-        if self.zmq_bridge is None:
-            raise RuntimeError("generate_async requires zmq_bridge")
+        """Async generator of codebook_id chunks. Call await start_zmq_tasks() first."""
+        if not (self._use_mp_engines and self._mp_holder is not None):
+            raise RuntimeError("generate_async requires start_zmq_tasks() to be called first")
         talker_sampling_params = SamplingParams(temperature=1.0, max_tokens=1)
         predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
         request_id = request_id or str(uuid.uuid4())
@@ -836,20 +1203,42 @@ class Qwen3TTSInterface:
             if next_talker_embeds.dim() == 2:
                 next_talker_embeds = next_talker_embeds.unsqueeze(0)
             generation_step = 0
-            self.talker_llm.add_request([next_talker_embeds], talker_sampling_params, request_id=request_id)
+
+            self._mp_holder.talker_client.send_add_request(request_id, [next_talker_embeds], talker_sampling_params)
+            logger.info(f"[gen_async:{request_id[:8]}] add_request sent to talker, waiting for first message ...")
 
             while True:
+                t_wait_talker = time.time()
                 engine_type, msg_type, payload = await request_queue.get()
+                t_got_talker = time.time()
+                if generation_step == 0:
+                    logger.info(
+                        f"[gen_async:{request_id[:8]}] first message: {engine_type!r} {msg_type!r} "
+                        f"(wait_ms={(t_got_talker - t_wait_talker)*1000:.1f})"
+                    )
+
                 if engine_type == "talker" and msg_type == "done":
-                    self.talker_llm.clear_request(request_id)
+                    if generation_step == 0:
+                        logger.warning(
+                            f"[gen_async:{request_id[:8]}] exiting with 0 codes (talker sent 'done' immediately)"
+                        )
+                    self._mp_holder.talker_client.send_clear_request(request_id)
                     break
                 if engine_type == "talker" and msg_type == "token":
                     token_ids = payload["token_ids"]
                     hidden_states = payload.get("hidden_states")
                     last_id = token_ids[-1]
+                    if generation_step == 0:
+                        logger.info(f"[gen_async:{request_id[:8]}] first token: last_id={last_id} (2150=EOS)")
                     if last_id == 2150:
-                        self.talker_llm.clear_request(request_id)
+                        if generation_step == 0:
+                            logger.warning(
+                                f"[gen_async:{request_id[:8]}] exiting with 0 codes (talker sent EOS token 2150 immediately)"
+                            )
+                        self._mp_holder.talker_client.send_clear_request(request_id)
                         break
+
+                    t_cpu_start = time.time()
                     last_id_hidden = self.input_embedding(torch.tensor([last_id], device=self.device)).unsqueeze(0)
                     if hidden_states is not None:
                         h = torch.from_numpy(hidden_states.copy()).to(self.device)
@@ -861,14 +1250,29 @@ class Qwen3TTSInterface:
                     else:
                         last_hidden_state = last_id_hidden.unsqueeze(0)
                     predictor_inputs_embeds = torch.cat((last_hidden_state, last_id_hidden), dim=1)
-                    self.predictor_llm.add_request(
-                        [predictor_inputs_embeds], predictor_sampling_params, request_id=request_id,
+                    t_cpu_end = time.time()
+
+                    self._mp_holder.predictor_client.send_add_request(
+                        request_id, [predictor_inputs_embeds], predictor_sampling_params,
                     )
+                    t_pred_submitted = time.time()
+
+                    if generation_step % 10 == 0:
+                        logger.info(
+                            f"[gen_async:{request_id[:8]}] step={generation_step} "
+                            f"wait_talker={(t_got_talker - t_wait_talker)*1000:.1f}ms "
+                            f"cpu_prep={(t_cpu_end - t_cpu_start)*1000:.1f}ms "
+                            f"submit_pred={(t_pred_submitted - t_cpu_end)*1000:.1f}ms"
+                        )
+
+                    t_wait_pred = time.time()
                     _, _, payload2 = await request_queue.get()
+                    t_got_pred = time.time()
                     pred_token_ids = payload2.get("token_ids", [])
                     codebook_ids = [last_id] + pred_token_ids
                     yield codebook_ids
 
+                    t_post_start = time.time()
                     codec_hiddens = torch.cat(
                         [last_id_hidden]
                         + [self.predictor_input_embeddings[i](torch.tensor([pred_token_ids[i]], device=self.device)).unsqueeze(0) for i in range(15)],
@@ -880,8 +1284,26 @@ class Qwen3TTSInterface:
                     else:
                         next_talker_embeds = next_talker_embeds + tts_pad_embed
                     generation_step += 1
-                    self.talker_llm.add_request([next_talker_embeds], talker_sampling_params, request_id=request_id)
+
+                    self._mp_holder.talker_client.send_add_request(
+                        request_id, [next_talker_embeds], talker_sampling_params,
+                    )
+                    t_post_end = time.time()
+
+                    if generation_step % 10 == 1:
+                        logger.info(
+                            f"[gen_async:{request_id[:8]}] step={generation_step} "
+                            f"wait_pred={(t_got_pred - t_wait_pred)*1000:.1f}ms "
+                            f"post_cpu={(t_post_end - t_post_start)*1000:.1f}ms "
+                            f"frame_total={(t_post_end - t_wait_talker)*1000:.1f}ms"
+                        )
         finally:
+            try:
+                if self._mp_holder is not None:
+                    self._mp_holder.talker_client.send_clear_request(request_id)
+                    self._mp_holder.predictor_client.send_clear_request(request_id)
+            except Exception:
+                pass
             async with self._queues_lock:
                 self._request_queues.pop(request_id, None)
 
@@ -894,6 +1316,9 @@ class Qwen3TTSInterface:
         talker_sampling_params: SamplingParams,
         predictor_sampling_params: SamplingParams,
     ):
+        """Sync generation (not supported when using multiprocess-only interface)."""
+        raise RuntimeError("Sync generation is not supported; use async API (start_zmq_tasks + generate_*_async).")
+
         generation_step = 0
         next_talker_embeds = inputs_embeds
         if next_talker_embeds.dim() == 2:
@@ -954,6 +1379,10 @@ if __name__ == "__main__":
     start = time.time()
     audio_codes = list(interface.generate_custom_voice(text="Hi there, this is tsdocode, hope you are doing well.", language="English", speaker="Vivian"))
     end = time.time()
+
+    
+    
+    
 
     
     

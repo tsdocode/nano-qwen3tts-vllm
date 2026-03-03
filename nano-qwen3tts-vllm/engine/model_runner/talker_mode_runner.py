@@ -4,6 +4,7 @@ import json
 import torch
 from typing import Optional
 import time
+from tqdm import tqdm
 from safetensors.torch import load_file
 
 from nano_qwen3tts_vllm.engine.model_runner.base import ModelRunner
@@ -16,12 +17,18 @@ from nano_qwen3tts_vllm.utils.context import set_context, get_context, reset_con
 from nano_qwen3tts_vllm.config import Config
 from multiprocessing.synchronize import Event
 
+from logging import getLogger
+
+logger = getLogger(__name__)
+
 
 class TalkerModeModelRunner(ModelRunner):
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         super().__init__(config, rank, event)
         self.model = self.load_model(config)
         self.post_init(rank)
+        if not config.enforce_eager:
+            self.capture_cudagraph_prefill()
 
     def load_model(self, config: Config):
         with open(os.path.join(config.model, "config.json"), "r") as f:
@@ -43,10 +50,44 @@ class TalkerModeModelRunner(ModelRunner):
     
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, input_embeds: Optional[torch.Tensor] = None):
+        start = time.time()
+        use_graph = False
         model_input = input_embeds if input_embeds is not None else input_ids
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill:
+            num_tokens = model_input.size(0)
+            context = get_context()
+            num_seqs = context.cu_seqlens_q.size(0) - 1
+            use_prefill_graph = (
+                not self.enforce_eager
+                and getattr(self, "graphs_prefill", None) is not None
+                and num_seqs == 1
+                and 1 <= num_tokens <= 256
+                and num_tokens in self.graphs_prefill
+                and context.block_tables is None
+            )
+            
+            use_graph = use_prefill_graph
+            if use_prefill_graph:
+                graph = self.graphs_prefill[num_tokens]
+                graph_vars = self.graph_vars_prefill
+                graph_vars["input_embeds"][:num_tokens].copy_(model_input)
+                graph_vars["positions"][:num_tokens].copy_(positions)
+                graph_vars["cu_seqlens_q"][0] = 0
+                graph_vars["cu_seqlens_q"][1] = num_tokens
+                graph_vars["cu_seqlens_k"][0] = 0
+                graph_vars["cu_seqlens_k"][1] = num_tokens
+                graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["slot_mapping"][:num_tokens].copy_(context.slot_mapping)
+                graph.replay()
+                hidden_states = graph_vars["outputs"][:num_tokens].clone()
+                graph_latency_ms = (time.time() - start) * 1000
+                logger.info(f"[talker mode model runner] Prefill graph num_tokens={num_tokens} latency={graph_latency_ms:.4f}ms")
+            else:
+                hidden_states = self.model(model_input, positions)
+        elif self.enforce_eager or model_input.size(0) > 512:
             hidden_states = self.model(model_input, positions)
         else:
+            use_graph = True
             bs = input_embeds.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -59,15 +100,16 @@ class TalkerModeModelRunner(ModelRunner):
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            
             hidden_states = graph_vars["outputs"][:bs]
-            
+
         logits = self.model.compute_logits(hidden_states)
         
         if is_prefill:
             context = get_context()
             last_indices = context.cu_seqlens_q[1:] - 1
             hidden_states = hidden_states[last_indices].contiguous()
+        
+        logger.info(f"[talker mode model runner] Model run prefill={is_prefill} {input_embeds.shape} latency: {time.time() - start} use_graph={use_graph}")
 
         return logits, hidden_states
 
@@ -115,7 +157,7 @@ class TalkerModeModelRunner(ModelRunner):
     def capture_cudagraph(self):
         config = self.config
         hf_config = self.model_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, 2048)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         input_embeds = torch.zeros(max_bs, hf_config.hidden_size)
@@ -148,4 +190,45 @@ class TalkerModeModelRunner(ModelRunner):
             block_tables=block_tables,
             outputs=outputs,
         )
+        
+    @torch.inference_mode()
+    def capture_cudagraph_prefill(self):
+        """Capture CUDA graphs for prefill: 1 seq, token counts 1 to 512 inclusive."""
+        config = self.config
+        hf_config = self.model_config
+        max_num_tokens = 257  # buffer size; capture for 1..512
+        input_embeds = torch.zeros(max_num_tokens, hf_config.hidden_size, device="cuda")
+        positions = torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
+        slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32, device="cuda")
+        cu_seqlens_q = torch.zeros(2, dtype=torch.int32, device="cuda")
+        cu_seqlens_k = torch.zeros(2, dtype=torch.int32, device="cuda")
+        outputs = torch.zeros(max_num_tokens, hf_config.hidden_size, device="cuda")
+        self.graph_bs_prefill = list(range(1, 257))  # 1 to 512 inclusive
+        self.graphs_prefill = {}
+        graph_pool = self.graph_pool
 
+        for bs in tqdm(reversed(self.graph_bs_prefill)):
+            graph = torch.cuda.CUDAGraph()
+            cu_seqlens_q[0] = 0
+            cu_seqlens_q[1] = bs
+            cu_seqlens_k[0] = 0
+            cu_seqlens_k[1] = bs
+            set_context(True, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                        max_seqlen_q=bs, max_seqlen_k=bs, slot_mapping=slot_mapping[:bs])
+            outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # warmup
+            with torch.cuda.graph(graph, graph_pool):
+                outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # capture
+            if graph_pool is None:
+                graph_pool = graph.pool()
+            self.graphs_prefill[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.graph_vars_prefill = dict(
+            input_embeds=input_embeds,
+            positions=positions,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            slot_mapping=slot_mapping,
+            outputs=outputs,
+        )

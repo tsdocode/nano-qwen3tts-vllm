@@ -10,6 +10,8 @@ I am building this while diving deep into both the [nano-vllm](https://github.co
 Optimization for the Qwen3-TTS model will continue in the [vllm-omni](https://github.com/vllm-project/vllm-omni) repo—stay tuned for updates!
 
 ## Highlights
+> [!IMPORTANT]
+> 🎉 **Breakthrough:** 8 concurrent audio streams can now run at near real-time speed on H100 for 1.7B model with new refactor now, enabling true parallel multi-user TTS service!
 
 ### Performance Optimizations
 - **Continuous Batching** — Batches multiple sequences and schedules prefill/decode across them for higher throughput.
@@ -222,9 +224,9 @@ sf.write("output_cloned.wav", wavs[0], sr)
 
 **See**: [`examples/voice_clone_example.py`](examples/voice_clone_example.py) for comprehensive examples with ICL and x_vector modes.
 
-### Streaming (ZMQ + async)
+### Streaming (multiprocess)
 
-With `USE_ZMQ=1`, the server uses an async engine loop and streams codec chunks; `POST /v1/audio/speech` returns a streaming PCM response.
+The server uses multiprocess engines (talker + predictor in separate processes) and streams codec chunks; `POST /v1/audio/speech` returns a streaming PCM response.
 
 ```python
 # Client: stream PCM and write to file (see examples/client.py)
@@ -241,7 +243,6 @@ r = requests.post(
 
 ```bash
 export QWEN3_TTS_MODEL_PATH=/path/to/qwen3tts
-export USE_ZMQ=1
 python -m uvicorn examples.server:app --host 0.0.0.0 --port 8000
 # or
 python examples/server.py
@@ -254,7 +255,7 @@ python examples/server.py
 | `model_path` | Path to Qwen3-TTS model (custom voice) |
 | `enforce_eager` | Disable CUDA graphs (for debugging) |
 | `tensor_parallel_size` | Number of GPUs (1–8) |
-| `USE_ZMQ` | Use ZMQ + async engine for streaming (server) |
+| (multiprocess) | Talker and predictor run in separate processes (server) |
 | `QWEN3_TTS_MODEL_PATH` | Model directory (server env) |
 
 ## Examples

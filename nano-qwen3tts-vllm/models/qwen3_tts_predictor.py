@@ -10,9 +10,7 @@ architecture by:
 import torch
 from torch import nn
 import torch.distributed as dist
-from nano_qwen3tts_vllm.engine.model_runner.base import get_context
-
-
+from nano_qwen3tts_vllm.utils.context import get_context
 from nano_qwen3tts_vllm.layers.layernorm import Qwen3TTSRMSNorm
 from nano_qwen3tts_vllm.models.qwen3_tts_share import Qwen3TTSDecoderLayer
 

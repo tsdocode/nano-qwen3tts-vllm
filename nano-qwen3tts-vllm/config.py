@@ -51,6 +51,9 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    distributed_port: int = 29500
+    # When set (e.g. in multiprocess workers), KV cache is capped to this fraction of GPU (avoids OOM).
+    process_gpu_memory_fraction: float | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
