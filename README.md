@@ -11,6 +11,7 @@ Optimization for the Qwen3-TTS model will continue in the [vllm-omni](https://gi
 
 ## Highlights
 > [!IMPORTANT]
+> AWS Inf2 optimization: 64 CCUs with TTFA under 300ms https://github.com/tsdocode/aws-inf2-qwen3-tts/tree/main
 > 🎉 **Breakthrough:** 8 concurrent audio streams can now run at near real-time speed on H100 for 1.7B model with new refactor now, enabling true parallel multi-user TTS service!
 
 ### Performance Optimizations
